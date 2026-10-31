@@ -17,7 +17,11 @@ Exit code: 0 on success; doctor exits 1 when its status is `fail`; an error exit
   voice-enhance bleed-reduce <media>... -o <out_dir> --json
                                     microphone tracks with the other mics' cross-talk reduced, one mono 32-bit float WAV
                                     per track (ADR-005) [--audio-streams 0,1] [--engine crosstalk] [--dominance-db N]
-                                    [--timeout S] [--overwrite] [--ffmpeg-skill DIR] [--offline]"""
+                                    [--timeout S] [--overwrite] [--ffmpeg-skill DIR] [--offline]
+  voice-enhance remux <video> <stem> -o <out> --json
+                                    the stem back into the video through ffmpeg-skill/audio --replace: video stream
+                                    copied, the stem as the only audio stream, same container (ADR-006)
+                                    [--drop-other-audio] [--timeout S] [--overwrite] [--ffmpeg-skill DIR] [--offline]"""
 from __future__ import annotations
 
 import argparse
@@ -31,7 +35,7 @@ from .doctor import doctor, engines_report
 from .errors import VoiceEnhanceError
 from .engines.crosstalk import DEFAULTS as CROSSTALK_DEFAULTS, LIMITS as CROSSTALK_LIMITS, MAX_TRACKS
 from .engines.nara_wpe_engine import DEFAULTS as WPE_DEFAULTS, LIMITS as WPE_LIMITS
-from .ops import BleedReduceRequest, DereverbRequest, IsolateRequest, bleed_reduce, dereverb, isolate
+from .ops import BleedReduceRequest, DereverbRequest, IsolateRequest, RemuxRequest, bleed_reduce, dereverb, isolate, remux
 from .service import DEFAULT_TIMEOUT
 
 
@@ -93,6 +97,19 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--ffmpeg-skill", help="ffmpeg-skill checkout directory")
     b.add_argument("--offline", action="store_true", help="no network (every registered engine already needs none)")
     b.add_argument("--json", action="store_true")
+    m = sub.add_parser("remux", help="put a stem back into its video through ffmpeg-skill/audio --replace: the video stream copied, "
+                       "the stem as the only audio stream")
+    m.add_argument("input", help="the video (never modified); one video stream")
+    m.add_argument("stem", help="the audio to put under the picture (a stem from isolate, dereverb or bleed-reduce)")
+    m.add_argument("-o", "--output", required=True, help="output file with the input's extension (refused if it exists, unless "
+                   "--overwrite)")
+    m.add_argument("--drop-other-audio", action="store_true", help="accept an input with several audio streams: the output keeps "
+                   "only the stem (ffmpeg-skill cannot replace one stream and keep the others)")
+    m.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help=f"ffmpeg-skill time limit in seconds (default {DEFAULT_TIMEOUT:g})")
+    m.add_argument("--overwrite", action="store_true", help="allow replacing an existing output")
+    m.add_argument("--ffmpeg-skill", help="ffmpeg-skill checkout directory")
+    m.add_argument("--offline", action="store_true", help="accepted for symmetry; remux never uses the network")
+    m.add_argument("--json", action="store_true")
     return ap
 
 
@@ -115,6 +132,12 @@ def _human(doc: Dict[str, Any]) -> None:
     if doc.get("error"):
         err = doc["error"]
         sys.stderr.write(f"error [{err['code']}]: {err['message']}\n")
+    elif doc.get("op") == "remux":
+        o = doc["output"]
+        print(f"wrote {o['path']} ({o['duration']:.2f}s, video {o['video']['codec']} copied, audio {o['audio']['codec']} "
+              f"{o['audio']['channels']} ch)")
+        for w in doc.get("warnings", []):
+            print(f"  warning: {w}")
     elif "op" in doc and "outputs" in doc:
         e = doc["engine"]
         for o in doc["outputs"]:
@@ -136,6 +159,8 @@ def _human(doc: Dict[str, Any]) -> None:
                 print(f"    install: {e['install']}")
         for op, o in doc["checks"]["operations"].items():
             print(f"  op {op:14} implemented={o['implemented']} engine={o['engine']} ready={o['ready']}")
+        for name, h in doc["checks"].get("helpers", {}).items():
+            print(f"  helper {name:10} implemented={h['implemented']} ffmpeg-skill={h['ffmpeg_skill_tool']} ready={h['ready']}")
         for p in doc["problems"]:
             print(f"  problem: {p}")
     elif "engines" in doc and "skill_id" not in doc:
@@ -171,6 +196,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                                            engine=args.engine, timeout=args.timeout, overwrite=args.overwrite, taps=args.taps,
                                            delay=args.delay, iterations=args.iterations, ffmpeg_skill_dir=args.ffmpeg_skill,
                                            offline=args.offline)), as_json)
+            return 0
+        if args.cmd == "remux":
+            _emit(remux(RemuxRequest(input_path=args.input, stem_path=args.stem, output_path=args.output,
+                                     drop_other_audio=args.drop_other_audio, timeout=args.timeout, overwrite=args.overwrite,
+                                     ffmpeg_skill_dir=args.ffmpeg_skill, offline=args.offline)), as_json)
             return 0
         if args.cmd == "bleed-reduce":
             _emit(bleed_reduce(BleedReduceRequest(input_paths=args.inputs, output_dir=args.output, audio_streams=args.audio_streams,

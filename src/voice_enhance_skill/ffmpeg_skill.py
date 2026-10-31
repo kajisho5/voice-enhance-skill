@@ -14,9 +14,11 @@ Which ffmpeg-skill tools are used, and for what (ADR-003):
           `--mono` on that one-stream WAV when it has more than one channel; `--sample-rate` only when this
           checkout declares it (OPTIONAL_FLAGS, capability-detected). DEREVERB uses the first pass only: WPE takes any
           rate and channel count (ADR-004). BLEED_REDUCE prepares every track like ISOLATE, at the first
-          track's rate (ADR-005). Step 6 adds `--replace` (the cleaned stem back
-          into the video, video stream copied) with `--overwrite` only when the caller asked for it
-`join` is not used: it refuses a single clip, so it cannot convert one file (ADR-003).
+          track's rate (ADR-005). REMUX (step 6, ADR-006) is `<video> --replace <stem> -o <out>`: the stem
+          becomes the only audio stream, encoded by the output's extension, padded or trimmed to the input's
+          duration, the first video stream copied packet for packet (-c:v copy)
+`join` is not used: it refuses a single clip, so it cannot convert one file (ADR-003). `--overwrite` is never passed:
+every ffmpeg-skill output is a fresh file in a private run directory, renamed into place by this skill (ADR-006).
 """
 from __future__ import annotations
 
@@ -35,7 +37,7 @@ ENV_DIR_KEYS = ("VOICE_ENHANCE_FFMPEG_SKILL_DIR", "VIDEO_AGENT_FFMPEG_SKILL_DIR"
 TOOLS_USED = ("probe", "audio")
 FLAGS_USED: Dict[str, Tuple[str, ...]] = {
     "probe": ("inputs",),
-    "audio": ("input", "output", "replace", "audio_stream", "mono", "overwrite", "json"),
+    "audio": ("input", "output", "replace", "audio_stream", "mono", "json"),
 }
 # Used when the checkout declares them, never required: without audio --sample-rate an input whose audio is not at the
 # engine's rate is refused with FFMPEG_SKILL_UNAVAILABLE (ADR-003).
@@ -182,6 +184,18 @@ class FfmpegSkill:
                                         "--sample-rate, which this ffmpeg-skill checkout does not declare",
                                         {"tool": "ffmpeg-skill/audio", "needs_flag": "sample_rate", "directory": str(self.directory)})
             args += ["--sample-rate", str(int(sample_rate))]
+        return self._audio(args, src, dst, timeout)
+
+    def replace_audio(self, video: str, stem: str, dst: str, *, timeout: Optional[float] = None) -> Dict[str, Any]:
+        """ffmpeg-skill/audio <video> --replace <stem> -o <dst>: `dst` holds the first video stream of `video` copied
+        packet for packet (-c:v copy) and the stem's first audio stream as its only audio stream, encoded by `dst`'s
+        extension and padded or trimmed to `video`'s duration; subtitle and data streams are copied when the
+        container takes them. `dst` must not exist (a fresh file in a private run directory; --overwrite is never
+        passed). Returns ffmpeg-skill's result document (its `probe` describes `dst`)."""
+        args = [self.script("audio"), os.path.abspath(video), "--replace", os.path.abspath(stem), "-o", os.path.abspath(dst), "--json"]
+        return self._audio(args, video, dst, timeout)
+
+    def _audio(self, args: List[str], src: str, dst: str, timeout: Optional[float]) -> Dict[str, Any]:
         code, out, err = self._run(args, timeout or self.timeout)
         doc = _parse_json(out)
         if code != 0 or doc.get("status") == "failed" or not os.path.isfile(dst):

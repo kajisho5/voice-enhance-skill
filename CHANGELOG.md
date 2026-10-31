@@ -2,6 +2,13 @@
 
 ## 0.1.0 - unreleased
 
+Remux helper (roadmap step 6).
+
+- ADR-006: `voice-enhance remux <video> <stem> -o <out>` puts a stem back into its video through one ffmpeg-skill `audio --replace` call. The video stream is copied packet for packet, and the stem becomes the only audio stream (AAC for `.mp4` / `.mov` / `.mkv`), padded with silence or trimmed to the video's length. The output keeps the input's container. Optional `--drop-other-audio`, `--timeout`, `--overwrite`, `--ffmpeg-skill`, `--offline`. Result schema `voice-enhance/remux@1`. It is a helper tool in the contract (`voice-enhance/remux`, no engine), not a capability, and `doctor` reports it under `checks.helpers`.
+- Refused before any media is written where `audio --replace` would lose a stream: no video stream (`INVALID_ARGUMENT`), a second video stream (`FFMPEG_SKILL_UNAVAILABLE`), or other audio streams unless `--drop-other-audio` (`FFMPEG_SKILL_UNAVAILABLE`, with that flag as the workaround). The output is checked through ffmpeg-skill/probe (one video and one audio stream; the video's codec, profile, size, pixel format, frame rate, frame count and length unchanged) and renamed into place from a private run directory.
+- `overwrite` is no longer among the ffmpeg-skill `audio` flags this skill requires: every ffmpeg-skill output is a fresh file in a run directory. Provenance accepts `engine: null` for an op that runs no engine.
+- Tests: the video packets (pts and MD5) are byte-identical in input and output through the real ffmpeg-skill, on a Matroska / FFV1 file with two audio streams (ISOLATE's stem of stream 1 put back) and on an MP4 / MPEG-4 file through the CLI. Unit tests use a stub whose videos carry a picture payload.
+
 BLEED_REDUCE op (roadmap step 5).
 
 - ADR-005: `voice-enhance bleed-reduce <media>... -o <out_dir>` reduces microphone cross-talk in 2-8 time-aligned tracks: the audio streams of one file, or one stream per file (`--audio-streams`). It writes one mono 32-bit float WAV per track, `<input name>_a<stream>.wav`, each with its own length and sample-aligned with its input. Optional `--engine`, `--dominance-db` (default 3), `--timeout`, `--overwrite`, `--ffmpeg-skill`, `--offline`. Result schema `voice-enhance/bleed-reduce@1` with per-track `outputs`, `inputs` and `steps`, and the measured `coupling_db` matrix. `voice.bleed_reduce` is `EXPERIMENTAL`.

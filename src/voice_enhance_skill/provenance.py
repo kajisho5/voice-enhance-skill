@@ -16,12 +16,13 @@ def sha256_file(path: str, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
-def build_provenance(*, op: str, engine: Dict[str, Any], input_path: Union[str, Sequence[str]],
+def build_provenance(*, op: str, engine: Optional[Dict[str, Any]], input_path: Union[str, Sequence[str]],
                      output_path: Union[None, str, Sequence[str]], parameters: Dict[str, Any],
                      ffmpeg_skill: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """`engine` is an engine report (Engine.report()); only publishable fields are copied (no local paths). With lists
     of paths (BLEED_REDUCE: several inputs and one output per track) the block has `inputs` and `outputs`, one
-    {"sha256"} per file in order, in place of `input` and `output`."""
+    {"sha256"} per file in order, in place of `input` and `output`. `engine` is None for REMUX, which runs no engine
+    (ADR-006)."""
     if isinstance(input_path, str):
         files: Dict[str, Any] = {"input": {"sha256": sha256_file(input_path)},
                                  "output": {"sha256": sha256_file(str(output_path))} if output_path else None}
@@ -31,8 +32,9 @@ def build_provenance(*, op: str, engine: Dict[str, Any], input_path: Union[str, 
     return {
         "skill": {"id": SKILL_ID, "version": __version__},
         "op": op,
-        "engine": {k: engine.get(k) for k in ("id", "version", "model", "model_sha256", "code_license", "weights_license", "attribution",
-                                              "execution_mode", "deterministic")},
+        "engine": None if engine is None else {k: engine.get(k) for k in ("id", "version", "model", "model_sha256", "code_license",
+                                                                          "weights_license", "attribution", "execution_mode",
+                                                                          "deterministic")},
         **files,
         "parameters": dict(parameters),
         "ffmpeg_skill": None if ffmpeg_skill is None else {k: ffmpeg_skill.get(k) for k in ("version", "contract_version")},

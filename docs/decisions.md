@@ -160,3 +160,63 @@ Roadmap step 5: BLEED_REDUCE on multi-mic input, done when the cross-talk energy
 - Per-block coupling estimates for talkers who move, and couplings over several frames for strongly reverberant bleed, if the real-recording measurement shows the need.
 - Real-recording measurement (a Japanese panel or interview, cross-talk energy and a transcription-skill round trip) before `voice.bleed_reduce` leaves `EXPERIMENTAL`.
 - `ecosystem.json` in AI-video-production-OS: add `{"name": "crosstalk (signal processing)", "note": "マイク被り低減 / MIT / 重みなし・NumPy / CPU"}` to the engines that ADR-001 lists (pending there, as ADR-001's value is).
+
+## ADR-006 REMUX helper: the stem back under the picture through ffmpeg-skill `audio --replace`, refused where that tool would lose a stream
+
+### Context
+
+Roadmap step 6: a remux helper that puts a cleaned stem back into the video, "via ffmpeg-skill audio --replace", done when the video stream is byte-identical. ADR-001 makes every media step an ffmpeg-skill tool call and forbids a private ffmpeg call. ISOLATE, DEREVERB and BLEED_REDUCE all write stems that are sample-aligned with their input stream (ADR-003, ADR-004, ADR-005), so that they can go back under the picture. Checked against ffmpeg-skill 2.22.5 (main, 2026-10-31), `scripts/audio.py`.
+
+What `audio <video> --replace <file> -o <out>` does in 2.22.5:
+
+- It maps `0:v:0` with `-c:v copy`. Only the **first** video stream is kept, and its packets are copied.
+- The replacement file's first audio stream becomes the output's **only** audio stream. Every audio stream of the video is dropped.
+- That audio is padded with silence or trimmed to the video's container duration (`apad,atrim=0:<duration>`), so the picture is never shortened.
+- The audio codec comes from the output extension (AAC 192 kb/s for `.mp4`, `.mov`, `.mkv` and anything else that is not an audio extension). `-movflags +faststart` is added for `.mp4` / `.mov` / `.m4v`.
+- Subtitle and data streams are copied when the container takes them. Otherwise they are dropped, and the result says `dropped_non_av_streams: true`.
+- A silent replacement file (peak at or below -50 dBFS) is mixed anyway, with a note.
+- The result document carries `encoder: "copy"` and a probe of the output.
+
+### Decision
+
+- **Command.** `voice-enhance remux <video> <stem> -o <out> [--drop-other-audio] [--timeout S] [--overwrite] [--ffmpeg-skill DIR] [--offline] --json`. Result schema `voice-enhance/remux@1`: `output` (path, format, duration, `video` with the checked properties and `stream_copied`, `audio`), `input`, `stem`, `parameters`, `steps`, `provenance`, `warnings`. The stem can be any audio file ffmpeg-skill reads. Its first audio stream is used.
+- **A helper, not a capability.** Muxing is ffmpeg-skill's job (`ecosystem.json` gives this repository the three voice jobs only). `remux` is a tool in the contract (`voice-enhance/remux`, role `assembly`, `roadmap_step` 6, no engine), not a `provides` entry. `doctor` reports it under `checks.helpers.remux`, ready when ffmpeg-skill and FFmpeg are. It runs no engine and no worker, and its provenance has `engine: null`, with `inputs` (video, stem) and `outputs`.
+- **One ffmpeg-skill call, nothing private.** The op runs `audio <video> --replace <stem> -o <run dir>/out<ext> --json` through the adapter (`FfmpegSkill.replace_audio`), with absolute paths and a fixed argv. The work happens in a private `.voice-enhance-*` directory in the output's directory, as for the ops. The validated file is renamed into place, so the output appears whole or not at all. `--overwrite` is never passed to ffmpeg-skill: its output is always a fresh file. `overwrite` is therefore dropped from the `audio` flags this skill requires (ADR-002 listed it for this step).
+- **Same container.** The output must have the input's extension. The video stream is copied, not re-encoded, and a container change can fail for a codec the new container cannot hold. That is ffmpeg-skill `export`'s job. An input with an audio extension is refused (`INVALID_ARGUMENT`), because ffmpeg-skill drops the picture for those.
+- **Refused before any media is written, where `--replace` would lose a stream.** The checks run cheapest first: numbers and paths, then ffmpeg-skill usable, then `probe` of the video and the stem.
+  - **No video stream:** `INVALID_ARGUMENT`.
+  - **More than one video stream:** `FFMPEG_SKILL_UNAVAILABLE` (`needs: audio --replace keeping every video stream`). `--replace` copies `0:v:0` only, and there is no flag to keep the others. A cover picture is not counted (ffmpeg-skill's `stream_counts`).
+  - **More than one audio stream:** `FFMPEG_SKILL_UNAVAILABLE` (`needs: audio --replace of one audio stream, keeping the others`, `workaround: --drop-other-audio`). With `--drop-other-audio` the output has the stem as its only audio stream, and a warning says how many streams were left out. This is the BLEED_REDUCE or multi-lavalier case. Silently losing the other microphones, or a second language, would be a data loss the caller never asked for.
+  - **A stem with no audio stream:** `UNSUPPORTED_MEDIA`.
+- **Warnings, not refusals.** These cases still give a usable output, so the op warns:
+  - The stem's length differs from the video's beyond max(0.1 s, 1 %): ffmpeg-skill pads or trims it.
+  - The stem has several audio streams: only the first is used.
+  - The input's first audio stream starts more than half a frame (or 20 ms) away from its video. A stem extracted from it starts at its first sample and is placed at the video's start, so it is shifted by that much.
+  - Subtitle or data streams were dropped.
+  - ffmpeg-skill's own notes (a silent stem).
+- **Validation through `probe`, then byte identity in the tests.** ffmpeg-skill has no tool that hashes a stream's packets. So the op checks what `probe` can see. Anything else is `INVALID_RESULT`, and nothing is placed.
+  - Exactly one video and one audio stream.
+  - The video stream's codec, profile, width, height, pixel format and `r_frame_rate` are the input's.
+  - Its frame count is the input's when both are known (MP4 / MOV report it; Matroska does not).
+  - Its length is the input's (stream duration or Matroska's DURATION tag, ± max(0.1 s, 1 %)), and the file's duration is the input's.
+  
+  "Video stream byte-identical" is asserted by the integration tests, which hash every video packet (pts and MD5 of the data) of input and output with ffprobe. They do this on a Matroska / FFV1 file with two audio streams (ISOLATE's stem of stream 1 put back, with `--drop-other-audio`) and on an MP4 / MPEG-4 Part 2 file with AAC audio through the CLI. ffprobe is used there only to measure, like the ffmpeg calls that build the fixtures. The skill never calls either.
+- **Audio encoding is ffmpeg-skill's choice.** The stem is float WAV (DEREVERB, BLEED_REDUCE) or 16-bit (ISOLATE). In an `.mp4`, `.mov` or `.mkv` it becomes AAC at 192 kb/s, at the stem's rate and channels. That is the first lossy step in the chain, and it happens once, at the end. `--bitrate` exists in ffmpeg-skill and is not exposed here yet. A caller who wants a different codec runs ffmpeg-skill `export` on the result.
+- **Tests.** The unit tests use a stub whose "videos" are JSON files carrying a probe document and a picture payload. Its `replace_audio` copies the payload and puts the stem in as the only audio stream. They check:
+  - Every refusal happens before any `--replace` call or file: paths, container, stream counts, a stem without audio, and an existing output.
+  - The picture payload arrives unchanged and the result has the expected shape.
+  - The warnings appear, including `--drop-other-audio`, a short stem, an A/V offset, dropped subtitles and a silent stem.
+  - Each broken property gives `INVALID_RESULT` with nothing placed: frame count, codec, a second audio stream, duration.
+  - `--overwrite` works, the CLI works, and an ISOLATE stem goes through `remux` end to end.
+  
+  The integration tests run the real ffmpeg-skill as described above. Nothing in them needs an engine or NumPy, so they run in the integration job, where nothing may skip.
+
+### Follow-ups
+
+- Gaps to report to ffmpeg-skill. Each would let the op accept more inputs with no change to its method:
+  - Replacing one audio stream while copying the others (`audio --replace --audio-stream N`, or a `--keep-other-audio`). Then `--drop-other-audio` becomes optional.
+  - Keeping every video stream under `--replace`.
+  - A packet-hash comparison tool (for example `probe --packet-hashes v:0`). Then the op itself can assert byte identity instead of the properties `probe` reports.
+  - The audio start offset reported for every stream in `audio_streams`, not only for the first. Then the A/V offset warning can name the stream the stem came from.
+- Exposing ffmpeg-skill `audio --bitrate` (and, if ffmpeg-skill gains it, a codec choice such as PCM in `.mov` / `.mkv`), if callers ask for less lossy delivery than AAC 192 kb/s.
+- A `--remux` convenience on `isolate` and `dereverb` that chains this step, once the agent adapter (step 8) shows whether callers want one command or two.

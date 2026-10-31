@@ -1,5 +1,5 @@
-"""The ops: ISOLATE (roadmap step 3, ADR-003), DEREVERB (step 4, ADR-004) and BLEED_REDUCE (step 5, ADR-005). All three
-use the same frame: checked paths, an engine that is OK, the input prepared through ffmpeg-skill, the engine in the
+"""The ops: ISOLATE (roadmap step 3, ADR-003), DEREVERB (step 4, ADR-004) and BLEED_REDUCE (step 5, ADR-005), and the
+REMUX helper (step 6, ADR-006) that puts a stem back under the picture. The three ops use the same frame: checked paths, an engine that is OK, the input prepared through ffmpeg-skill, the engine in the
 worker subprocess, the result validated through ffmpeg-skill, then moved into place.
 
 ISOLATE, step by step:
@@ -24,6 +24,12 @@ per file), each prepared like ISOLATE's input but at the first track's sample ra
 a different rate only with audio --sample-rate, else FFMPEG_SKILL_UNAVAILABLE before any work). The crosstalk engine
 runs once on all of them and writes one float WAV per track. Every stem is validated through ffmpeg-skill/probe
 before any is placed; into a new output directory they move with one rename of the whole directory.
+
+REMUX runs no engine (ADR-006). It checks the paths (the output keeps the input's container), probes the video and the
+stem through ffmpeg-skill, refuses what ffmpeg-skill/audio --replace cannot do faithfully (a second video stream; other
+audio streams, unless --drop-other-audio), runs `audio <video> --replace <stem> -o <run dir>/out<ext>`, checks through
+ffmpeg-skill/probe that the video stream came through unchanged (codec, profile, size, pixel format, frame rate, frame
+count, duration) and that the output has exactly one video and one audio stream, then renames it into place.
 """
 from __future__ import annotations
 
@@ -46,6 +52,12 @@ from .service import DEFAULT_TIMEOUT, run_engine
 ISOLATE_SCHEMA = f"{SKILL_ID}/isolate@1"
 DEREVERB_SCHEMA = f"{SKILL_ID}/dereverb@1"
 BLEED_REDUCE_SCHEMA = f"{SKILL_ID}/bleed-reduce@1"
+REMUX_SCHEMA = f"{SKILL_ID}/remux@1"
+REMUX_STEP = 6
+# ffmpeg-skill/audio drops the picture for these output extensions, so none of them can be REMUX's input or output
+AUDIO_EXTENSIONS = (".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg", ".opus")
+# what a stream copy (-c:v copy) leaves unchanged and ffmpeg-skill/probe reports; checked on every REMUX output
+REMUX_VIDEO_KEYS = ("codec", "profile", "width", "height", "pix_fmt", "r_frame_rate")
 ISOLATE_RATE = 48000                 # deep-filter accepts 48 kHz WAV only (ADR-001)
 DURATION_TOLERANCE = 0.1             # seconds, or 1 % of the duration when that is larger
 PREPARED_NAME = "input.wav"
@@ -561,6 +573,196 @@ def bleed_reduce(req: BleedReduceRequest, skill: Optional[FfmpegSkill] = None) -
         "engine": {k: engine_doc.get(k) for k in ("id", "version", "model")},
         "parameters": parameters,
         "steps": steps,
+        "provenance": provenance,
+        "warnings": warnings,
+    }
+
+
+@dataclass
+class RemuxRequest:
+    input_path: str
+    stem_path: str
+    output_path: str
+    drop_other_audio: bool = False
+    timeout: float = DEFAULT_TIMEOUT
+    overwrite: bool = False
+    ffmpeg_skill_dir: Optional[str] = None
+    offline: bool = False
+
+
+def check_remux_paths(req: RemuxRequest) -> Tuple[str, str, str]:
+    """(absolute video, absolute stem, absolute output). The output keeps the video's container: the picture is copied,
+    not re-encoded, and a container change is ffmpeg-skill export's job. Nothing is written here."""
+    if not isinstance(req.timeout, (int, float)) or isinstance(req.timeout, bool) or req.timeout <= 0:
+        raise VoiceEnhanceError("INVALID_ARGUMENT", "--timeout must be > 0", {"timeout": req.timeout})
+    src, stem, dst = (os.path.abspath(p) for p in (req.input_path, req.stem_path, req.output_path))
+    for path, given, what in ((src, req.input_path, "input"), (stem, req.stem_path, "stem")):
+        if not os.path.isfile(path):
+            raise VoiceEnhanceError("INPUT_NOT_FOUND", f"{given} is not a file", {what: given})
+    if os.path.realpath(src) == os.path.realpath(stem) or os.path.samefile(src, stem):
+        raise VoiceEnhanceError("INVALID_ARGUMENT", "the stem is the input video itself", {"stem": req.stem_path})
+    ext = os.path.splitext(src)[1].lower()
+    if ext in AUDIO_EXTENSIONS or not ext:
+        raise VoiceEnhanceError("INVALID_ARGUMENT", f"{req.input_path} is not a video container; remux puts a stem back into a video "
+                                "(an audio file needs no remux: the stem is already its audio)", {"input": req.input_path})
+    if os.path.splitext(dst)[1].lower() != ext:
+        raise VoiceEnhanceError("INVALID_ARGUMENT", f"the output must keep the input's container ({ext}): the video stream is copied, "
+                                "not re-encoded. Change the container afterwards with ffmpeg-skill export", {"output": req.output_path})
+    for other, given in ((src, req.input_path), (stem, req.stem_path)):
+        if os.path.realpath(dst) == os.path.realpath(other) or (os.path.exists(dst) and os.path.samefile(dst, other)):
+            raise VoiceEnhanceError("OUTPUT_IS_INPUT", f"the output path is {given}; inputs are never modified", {"output": req.output_path})
+    if os.path.isdir(dst):
+        raise VoiceEnhanceError("INVALID_ARGUMENT", f"{req.output_path} is a directory", {"output": req.output_path})
+    if os.path.lexists(dst) and not req.overwrite:
+        raise VoiceEnhanceError("OUTPUT_EXISTS", f"{req.output_path} exists; pass --overwrite to replace it", {"output": req.output_path})
+    if not os.path.isdir(os.path.dirname(dst)):
+        raise VoiceEnhanceError("INVALID_ARGUMENT", f"the output directory {os.path.dirname(dst)} does not exist", {"output": req.output_path})
+    return src, stem, dst
+
+
+def stream_counts(facts: Dict[str, Any]) -> Tuple[int, int]:
+    """(video streams, audio streams) from an ffmpeg-skill probe document; a cover picture is not a video stream."""
+    counts = facts.get("stream_counts") if isinstance(facts.get("stream_counts"), dict) else {}
+    video = counts.get("video")
+    audio = counts.get("audio")
+    return (int(video) if isinstance(video, int) else int(isinstance(facts.get("video"), dict)),
+            int(audio) if isinstance(audio, int) else len(audio_streams(facts)))
+
+
+def _seconds(stream: Dict[str, Any]) -> Optional[float]:
+    """A stream's own length: its duration, or Matroska's DURATION tag."""
+    for key in ("duration", "tagged_duration"):
+        if isinstance(stream.get(key), (int, float)) and stream[key] > 0:
+            return float(stream[key])
+    return None
+
+
+def _tolerance(duration: float) -> float:
+    return max(DURATION_TOLERANCE, 0.01 * duration)
+
+
+def _check_remux_input(facts: Dict[str, Any], name: str, drop_other_audio: bool) -> Tuple[int, int]:
+    """Refuses, before any media is written, what ffmpeg-skill/audio --replace cannot do faithfully (ADR-006)."""
+    videos, audios = stream_counts(facts)
+    if videos == 0:
+        raise VoiceEnhanceError("INVALID_ARGUMENT", f"{name} has no video stream: there is no picture to put the stem under",
+                                {"input": name})
+    if videos > 1:
+        raise VoiceEnhanceError("FFMPEG_SKILL_UNAVAILABLE", f"{name} has {videos} video streams; ffmpeg-skill/audio --replace copies only "
+                                "the first (-map 0:v:0), so the others would be lost. Remux is refused until ffmpeg-skill can keep "
+                                "every video stream", {"tool": "ffmpeg-skill/audio", "needs": "audio --replace keeping every video stream",
+                                                       "video_stream_count": videos})
+    if audios > 1 and not drop_other_audio:
+        raise VoiceEnhanceError("FFMPEG_SKILL_UNAVAILABLE", f"{name} has {audios} audio streams; ffmpeg-skill/audio --replace writes the "
+                                "stem as the only audio stream and cannot replace one stream while keeping the others. Pass "
+                                "--drop-other-audio to accept an output with the stem as its only audio stream",
+                                {"tool": "ffmpeg-skill/audio", "needs": "audio --replace of one audio stream, keeping the others",
+                                 "audio_stream_count": audios, "workaround": "--drop-other-audio"})
+    return videos, audios
+
+
+def validate_remux(in_facts: Dict[str, Any], out_facts: Dict[str, Any]) -> None:
+    """The muxed file through ffmpeg-skill/probe: one video stream, unchanged by the copy (REMUX_VIDEO_KEYS, frame count
+    and length), one audio stream, and the input's length. Anything else is INVALID_RESULT."""
+    problems = []
+    vi = in_facts.get("video") or {}
+    vo = out_facts.get("video") if isinstance(out_facts.get("video"), dict) else {}
+    videos, audios = stream_counts(out_facts)
+    if (videos, audios) != (1, 1):
+        problems.append(f"{videos} video and {audios} audio stream(s), expected 1 and 1")
+    if vo:
+        for key in REMUX_VIDEO_KEYS:
+            if vi.get(key) != vo.get(key):
+                problems.append(f"video {key} {vo.get(key)!r}, expected {vi.get(key)!r}")
+        if vi.get("nb_frames") and vo.get("nb_frames") and vi["nb_frames"] != vo["nb_frames"]:
+            problems.append(f"{vo['nb_frames']} video frames, expected {vi['nb_frames']}")
+        din, dout = _seconds(vi), _seconds(vo)
+        if din and dout and abs(din - dout) > _tolerance(din):
+            problems.append(f"video length {dout:.3f}s, expected {din:.3f}s")
+    expected = float(in_facts.get("duration") or 0.0)
+    duration = float(out_facts.get("duration") or 0.0)
+    if abs(duration - expected) > _tolerance(expected):
+        problems.append(f"duration {duration:.3f}s, expected {expected:.3f}s (+/- {_tolerance(expected):.3f}s)")
+    if problems:
+        raise VoiceEnhanceError("INVALID_RESULT", "ffmpeg-skill/audio --replace output failed validation: " + "; ".join(problems),
+                                {"tool": "ffmpeg-skill/audio", "problems": problems})
+
+
+def _video_doc(v: Dict[str, Any]) -> Dict[str, Any]:
+    return dict({k: v.get(k) for k in REMUX_VIDEO_KEYS + ("nb_frames",)}, duration=_seconds(v))
+
+
+def _remux_warnings(facts: Dict[str, Any], stem_facts: Dict[str, Any], audios: int, drop_other_audio: bool) -> List[str]:
+    warnings = []
+    if audios > 1 and drop_other_audio:
+        warnings.append(f"the input's other {audios - 1} audio stream(s) are not in the output (--drop-other-audio): the stem is its "
+                        "only audio stream")
+    stem_audios = stream_counts(stem_facts)[1]
+    if stem_audios > 1:
+        warnings.append(f"the stem has {stem_audios} audio streams; only its first is used")
+    expected, got = float(facts.get("duration") or 0.0), float(stem_facts.get("duration") or 0.0)
+    if abs(got - expected) > _tolerance(expected):
+        warnings.append(f"the stem is {got:.3f}s and the video {expected:.3f}s; ffmpeg-skill "
+                        + ("pads it with silence" if got < expected else "trims it") + " to the video's length")
+    v, a = facts.get("video") or {}, facts.get("audio") if isinstance(facts.get("audio"), dict) else {}
+    vs, as_ = v.get("start_time"), a.get("start_time")
+    fps = v.get("fps") if isinstance(v.get("fps"), (int, float)) and v.get("fps") else None
+    if isinstance(vs, (int, float)) and isinstance(as_, (int, float)) and abs(as_ - vs) > (0.5 / fps if fps else 0.02):
+        warnings.append(f"the input's first audio stream starts {as_ - vs:+.3f}s from its video; a stem extracted from it starts at its "
+                        "first sample and is placed at the video's start, so it is shifted by that much")
+    return warnings
+
+
+def remux(req: RemuxRequest, skill: Optional[FfmpegSkill] = None) -> Dict[str, Any]:
+    """REMUX: `req.stem_path` (a stem from isolate, dereverb or bleed-reduce, or any audio file) put back into the video
+    `req.input_path` as `req.output_path`, through ffmpeg-skill/audio --replace: the video stream is copied packet for
+    packet, the stem becomes the only audio stream (encoded by the container: AAC for .mp4 / .mov / .mkv), padded or
+    trimmed to the video's length. `skill` is the ffmpeg-skill handle (located from `req.ffmpeg_skill_dir` when None)."""
+    src, stem, dst = check_remux_paths(req)
+    skill, info = _usable_skill(skill, req.ffmpeg_skill_dir, float(req.timeout))
+    facts = skill.probe(src)
+    _, audios = _check_remux_input(facts, os.path.basename(src), req.drop_other_audio)
+    stem_facts = skill.probe(stem)
+    if not isinstance(stem_facts.get("audio"), dict) or not stream_counts(stem_facts)[1]:
+        raise VoiceEnhanceError("UNSUPPORTED_MEDIA", f"{os.path.basename(stem)} has no audio stream", {"stem": req.stem_path})
+    warnings = _remux_warnings(facts, stem_facts, audios, req.drop_other_audio)
+    run_dir = _run_dir(os.path.dirname(dst), req.output_path)
+    try:
+        muxed = os.path.join(run_dir, "out" + os.path.splitext(dst)[1])
+        doc = skill.replace_audio(src, stem, muxed, timeout=float(req.timeout))
+        out_facts = skill.probe(muxed)
+        validate_remux(facts, out_facts)
+        out_audio = out_facts.get("audio") or {}
+        dropped = bool(doc.get("dropped_non_av_streams"))
+        if dropped:
+            warnings.append("the input's subtitle or data streams could not be copied into the output container and were left out")
+        warnings += [str(n) for n in doc.get("notes") or []]
+        step = {"tool": "ffmpeg-skill/audio", "flags": ["--replace", "<stem>"],
+                "result": {"video": doc.get("encoder"), "audio_codec": out_audio.get("codec"), "dropped_non_av_streams": dropped}}
+        parameters = {"drop_other_audio": bool(req.drop_other_audio), "video": "stream copy (ffmpeg-skill/audio -c:v copy)",
+                      "audio_codec": out_audio.get("codec"), "conformed_to_seconds": facts.get("duration"),
+                      "checked": list(REMUX_VIDEO_KEYS) + ["nb_frames", "duration", "stream_counts"]}
+        provenance = build_provenance(op="remux", engine=None, input_path=[src, stem], output_path=[muxed], parameters=parameters,
+                                      ffmpeg_skill=info.to_dict())
+        _place(muxed, dst, req.overwrite)
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+    stem_audio = stem_facts["audio"]
+    return {
+        "schema": REMUX_SCHEMA,
+        "ok": True,
+        "op": "remux",
+        "skill": {"id": SKILL_ID, "version": __version__},
+        "output": {"path": dst, "format": out_facts.get("format"), "duration": out_facts.get("duration"),
+                   "video": dict(_video_doc(out_facts.get("video") or {}), stream_copied=doc.get("encoder") == "copy"),
+                   "audio": {"codec": out_audio.get("codec"), "sample_rate": out_audio.get("sample_rate"),
+                             "channels": out_audio.get("channels"), "duration": _seconds(out_audio)}},
+        "input": {"path": src, "duration": facts.get("duration"), "video": _video_doc(facts.get("video") or {}),
+                  "audio_stream_count": audios},
+        "stem": {"path": stem, "duration": stem_facts.get("duration"),
+                 "audio": {k: stem_audio.get(k) for k in ("codec", "sample_rate", "channels")}},
+        "parameters": parameters,
+        "steps": [step],
         "provenance": provenance,
         "warnings": warnings,
     }

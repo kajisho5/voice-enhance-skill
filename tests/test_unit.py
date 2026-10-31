@@ -2,7 +2,8 @@
 mocked package lookups), the worker subprocess, the ISOLATE op (fake deep-filter, a stub ffmpeg-skill that reads and
 writes WAV with the stdlib), the DEREVERB op (a fake nara_wpe package on NumPy, the same stub ffmpeg-skill), the
 BLEED_REDUCE op (the crosstalk engine on NumPy, the same stub plus one that reads each channel of a WAV as an audio
-stream), doctor, provenance and the OS registry conformance checks. No engine, no weights and no ffmpeg are needed;
+stream), the REMUX helper (a stub ffmpeg-skill whose "videos" are JSON files carrying probe facts and a picture payload),
+doctor, provenance and the OS registry conformance checks. No engine, no weights and no ffmpeg are needed;
 nothing is downloaded. The DEREVERB and BLEED_REDUCE engine tests need NumPy and are skipped without it."""
 from __future__ import annotations
 
@@ -32,8 +33,8 @@ from voice_enhance_skill.engines import crosstalk, deepfilternet, nara_wpe_engin
 from voice_enhance_skill.engines.base import OPS, Engine, EngineRequest, EngineResult, parse_version
 from voice_enhance_skill.errors import ERROR_TABLE, EXIT_CODES, VoiceEnhanceError
 from voice_enhance_skill.ffmpeg_skill import FLAGS_USED, OPTIONAL_FLAGS, TOOLS_USED, FfmpegSkill, parse_contract
-from voice_enhance_skill.ops import (BleedReduceRequest, DereverbRequest, IsolateRequest, bleed_reduce, check_paths, dereverb,
-                                     isolate, select_engine, select_stream, track_name)
+from voice_enhance_skill.ops import (REMUX_VIDEO_KEYS, BleedReduceRequest, DereverbRequest, IsolateRequest, RemuxRequest, bleed_reduce,
+                                     check_paths, dereverb, isolate, remux, select_engine, select_stream, track_name)
 from voice_enhance_skill.procs import TIMEOUT_EXIT, run_process_group
 from voice_enhance_skill.provenance import build_provenance, sha256_file
 from voice_enhance_skill.service import run_engine
@@ -161,6 +162,19 @@ class ContractTests(unittest.TestCase):
         for flag in ("--audio-stream", "--engine", "--taps", "--delay", "--iterations", "--timeout", "--overwrite", "--ffmpeg-skill",
                      "--offline"):
             self.assertTrue(any(a.startswith("[" + flag) for a in tool["argv"]), flag)
+
+    def test_remux_tool_entry(self):
+        c = contract()
+        tool = next(t for t in c["tools"] if t["tool_id"] == f"{SKILL_ID}/remux")
+        self.assertEqual((tool["implemented"], tool["roadmap_step"], tool["engine"], tool["schema"], tool["ffmpeg_skill_tool"]),
+                         (True, 6, None, f"{SKILL_ID}/remux@1", "audio --replace"))
+        self.assertEqual(tool["output"]["checked"], list(REMUX_VIDEO_KEYS) + ["nb_frames", "duration", "stream_counts"])
+        for flag in ("--drop-other-audio", "--timeout", "--overwrite", "--ffmpeg-skill", "--offline"):
+            self.assertTrue(any(a.startswith("[" + flag) for a in tool["argv"]), flag)
+        # a helper, not a capability: the OS registry's provides stay the three voice ops (ADR-006)
+        self.assertNotIn(tool["tool_id"], {p["tool_id"] for p in c["provides"]})
+        self.assertIn("replace", FLAGS_USED["audio"])
+        self.assertNotIn("overwrite", FLAGS_USED["audio"])     # every ffmpeg-skill output is a fresh file in a run directory
 
     def test_version_comes_from_pyproject(self):
         want = re.search(r'^version = "([^"]+)"', (ROOT / "pyproject.toml").read_text(encoding="utf-8"), re.M).group(1)
@@ -1208,6 +1222,217 @@ class BleedReduceOpTests(unittest.TestCase):
         self.assertEqual((rc2, err["ok"], err["error"]["code"]), (EXIT_CODES["OUTPUT_EXISTS"], False, "OUTPUT_EXISTS"))
         self.assertEqual((rc3, again["ok"]), (0, True))
 
+VIDEO_FACTS = {"codec": "h264", "profile": "High", "width": 1920, "height": 1080, "pix_fmt": "yuv420p", "r_frame_rate": "30000/1001",
+               "fps": 29.97, "nb_frames": 30, "duration": 1.001, "start_time": 0.0}
+
+
+def write_video(path, seconds=1.001, audio_streams=1, video_streams=1, audio_start=0.0, payload="picture-0123"):
+    """A stand-in video for RemuxStub: a JSON file with the probe document ffmpeg-skill would print, plus `payload`, the
+    bytes of its picture (what -c:v copy must leave unchanged)."""
+    a = {"codec": "aac", "sample_rate": 48000, "channels": 2, "duration": seconds, "start_time": audio_start}
+    facts = {"format": "mov,mp4", "duration": seconds, "start_time": 0.0,
+             "video": dict(VIDEO_FACTS, duration=seconds) if video_streams else None,
+             "audio": a if audio_streams else None, "audio_streams": [dict(a, index=k) for k in range(audio_streams)],
+             "stream_counts": {"video": video_streams, "audio": audio_streams}}
+    Path(path).write_text(json.dumps({"facts": facts, "payload": payload}), encoding="utf-8")
+    return path
+
+
+class RemuxStub(StubSkill):
+    """StubSkill plus ffmpeg-skill/audio --replace on write_video() files: the output is the same JSON with the payload
+    copied and the stem as its only audio stream, conformed to the video's length. `mode` breaks one property of the
+    output (validation tests)."""
+
+    def __init__(self, mode="ok"):
+        super().__init__()
+        self.mode = mode
+
+    def probe(self, path):
+        try:
+            return json.loads(Path(path).read_text(encoding="utf-8"))["facts"]
+        except (ValueError, KeyError, UnicodeDecodeError):
+            return super().probe(path)
+
+    def replace_audio(self, video, stem, dst, timeout=None):
+        self.calls.append({"replace": os.path.basename(stem), "video": os.path.basename(video), "dst": os.path.basename(dst)})
+        doc = json.loads(Path(video).read_text(encoding="utf-8"))
+        facts, s = doc["facts"], super().probe(stem)
+        a = {"codec": "aac", "sample_rate": s["audio"]["sample_rate"], "channels": s["audio"]["channels"], "duration": facts["duration"],
+             "start_time": 0.0}
+        out = dict(facts, audio=a, audio_streams=[dict(a, index=0)], stream_counts={"video": 1, "audio": 1})
+        out["video"] = dict(facts["video"])
+        if self.mode == "frames":
+            out["video"]["nb_frames"] -= 1
+        elif self.mode == "codec":
+            out["video"]["codec"] = "mpeg4"
+        elif self.mode == "two_audio":
+            out["stream_counts"] = {"video": 1, "audio": 2}
+        elif self.mode == "short":
+            out["duration"] = facts["duration"] / 2
+        Path(dst).write_text(json.dumps({"facts": out, "payload": doc["payload"]}), encoding="utf-8")
+        return {"status": "completed", "output": dst, "encoder": "copy", "dropped_non_av_streams": self.mode == "dropped",
+                "notes": ["silent track(s) mixed anyway: --replace stem.wav peaks at -80 dBFS"] if self.mode == "silent" else []}
+
+
+class RemuxPlanningTests(unittest.TestCase):
+    """Every refusal comes before any media is written: the stub records no --replace call and no file appears."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+        self.video = write_video(os.path.join(self.tmp, "talk.mp4"))
+        self.stem = write_tone_wav(os.path.join(self.tmp, "voice.wav"), seconds=1.0)
+        self.out = os.path.join(self.tmp, "talk_clean.mp4")
+        self.skill = RemuxStub()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def refused(self, code, req):
+        with self.assertRaises(VoiceEnhanceError) as e:
+            remux(req, skill=self.skill)
+        self.assertEqual(e.exception.code, code, e.exception.message)
+        self.assertEqual([c for c in self.skill.calls if "replace" in c], [])
+        self.assertEqual(sorted(os.listdir(self.tmp)), sorted({"talk.mp4", "voice.wav"} | set(self.existing)))
+        return e.exception
+
+    existing = ()
+
+    def test_paths(self):
+        v, s, o = self.video, self.stem, self.out
+        self.refused("INVALID_ARGUMENT", RemuxRequest(v, s, o, timeout=0))
+        self.refused("INPUT_NOT_FOUND", RemuxRequest(os.path.join(self.tmp, "nope.mp4"), s, o))
+        self.refused("INPUT_NOT_FOUND", RemuxRequest(v, os.path.join(self.tmp, "nope.wav"), o))
+        self.refused("INVALID_ARGUMENT", RemuxRequest(v, v, o))                                   # the stem is the video
+        self.refused("INVALID_ARGUMENT", RemuxRequest(s, v, o))                                   # not a video container
+        self.assertIn("container", self.refused("INVALID_ARGUMENT", RemuxRequest(v, s, self.out.replace(".mp4", ".mkv"))).message)
+        self.refused("INVALID_ARGUMENT", RemuxRequest(v, s, os.path.join(self.tmp, "no-dir", "o.mp4")))
+        self.refused("OUTPUT_IS_INPUT", RemuxRequest(v, s, v, overwrite=True))
+
+    def test_existing_output(self):
+        Path(self.out).write_bytes(b"old")
+        self.existing = ("talk_clean.mp4",)
+        self.refused("OUTPUT_EXISTS", RemuxRequest(self.video, self.stem, self.out))
+        self.assertEqual(Path(self.out).read_bytes(), b"old")
+
+    def test_streams_ffmpeg_skill_cannot_carry_are_refused(self):
+        write_video(self.video, video_streams=0)
+        self.assertIn("no video stream", self.refused("INVALID_ARGUMENT", RemuxRequest(self.video, self.stem, self.out)).message)
+        write_video(self.video, video_streams=2)
+        e = self.refused("FFMPEG_SKILL_UNAVAILABLE", RemuxRequest(self.video, self.stem, self.out))
+        self.assertEqual((e.details["tool"], e.details["video_stream_count"]), ("ffmpeg-skill/audio", 2))
+        write_video(self.video, audio_streams=2)
+        e = self.refused("FFMPEG_SKILL_UNAVAILABLE", RemuxRequest(self.video, self.stem, self.out))
+        self.assertEqual((e.details["audio_stream_count"], e.details["workaround"]), (2, "--drop-other-audio"))
+        self.assertFalse(e.retryable)
+
+    def test_stem_without_audio(self):
+        not_audio = os.path.join(self.tmp, "voice.wav")
+        write_video(not_audio, audio_streams=0)
+        self.refused("UNSUPPORTED_MEDIA", RemuxRequest(self.video, not_audio, self.out))
+
+    def test_cli_errors_are_one_json_document(self):
+        rc, doc = run_cli("remux", self.video, os.path.join(self.tmp, "nope.wav"), "-o", self.out, "--json")
+        self.assertEqual((rc, doc["ok"], doc["error"]["code"]), (2, False, "INPUT_NOT_FOUND"))
+        write_video(self.video, audio_streams=2)
+        with mock.patch("voice_enhance_skill.ops.FfmpegSkill.locate", return_value=self.skill):
+            rc, doc = run_cli("remux", self.video, self.stem, "-o", self.out, "--json")
+        self.assertEqual((rc, doc["error"]["code"], doc["error"]["details"]["workaround"]),
+                         (EXIT_CODES["FFMPEG_SKILL_UNAVAILABLE"], "FFMPEG_SKILL_UNAVAILABLE", "--drop-other-audio"))
+        self.assertFalse(os.path.exists(self.out))
+
+
+class RemuxOpTests(unittest.TestCase):
+    """REMUX end to end with the stub: what ffmpeg-skill/audio --replace is asked, what is validated, what is placed."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+        self.video = write_video(os.path.join(self.tmp, "talk.mp4"))
+        self.stem = write_tone_wav(os.path.join(self.tmp, "voice.wav"), seconds=1.001)
+        self.out = os.path.join(self.tmp, "talk_clean.mp4")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def assert_no_leftovers(self):
+        self.assertEqual([n for n in os.listdir(self.tmp) if n.startswith(".voice-enhance-")], [])
+
+    def test_stem_goes_under_the_unchanged_picture(self):
+        skill = RemuxStub()
+        shas = (sha256_file(self.video), sha256_file(self.stem))
+        doc = remux(RemuxRequest(self.video, self.stem, self.out), skill=skill)
+        self.assertEqual((sha256_file(self.video), sha256_file(self.stem)), shas)        # inputs are never modified
+        placed = json.loads(Path(self.out).read_text(encoding="utf-8"))
+        self.assertEqual(placed["payload"], "picture-0123")                              # the picture came through as it was
+        self.assertEqual(skill.calls, [{"replace": "voice.wav", "video": "talk.mp4", "dst": "out.mp4"}])
+        self.assertEqual((doc["schema"], doc["ok"], doc["op"]), (f"{SKILL_ID}/remux@1", True, "remux"))
+        self.assertNotIn("capability", doc)
+        self.assertEqual(doc["output"]["path"], self.out)
+        self.assertEqual(doc["output"]["video"], dict({k: VIDEO_FACTS[k] for k in REMUX_VIDEO_KEYS + ("nb_frames",)},
+                                                      duration=1.001, stream_copied=True))
+        self.assertEqual(doc["output"]["audio"], {"codec": "aac", "sample_rate": 48000, "channels": 1, "duration": 1.001})
+        self.assertEqual((doc["input"]["audio_stream_count"], doc["stem"]["audio"]["channels"]), (1, 1))
+        self.assertEqual(doc["steps"], [{"tool": "ffmpeg-skill/audio", "flags": ["--replace", "<stem>"],
+                                         "result": {"video": "copy", "audio_codec": "aac", "dropped_non_av_streams": False}}])
+        self.assertEqual((doc["parameters"]["drop_other_audio"], doc["parameters"]["conformed_to_seconds"]), (False, 1.001))
+        prov = doc["provenance"]
+        self.assertEqual((prov["op"], prov["engine"]), ("remux", None))
+        self.assertEqual(prov["inputs"], [{"sha256": shas[0]}, {"sha256": shas[1]}])
+        self.assertEqual(prov["outputs"], [{"sha256": sha256_file(self.out)}])
+        self.assertEqual(doc["warnings"], [])
+        json.dumps(doc, allow_nan=False)
+        self.assert_no_leftovers()
+
+    def test_drop_other_audio_and_warnings(self):
+        write_video(self.video, audio_streams=3, audio_start=0.1)
+        short = write_tone_wav(os.path.join(self.tmp, "short.wav"), seconds=0.5)
+        doc = remux(RemuxRequest(self.video, short, self.out, drop_other_audio=True), skill=RemuxStub(mode="silent"))
+        w = doc["warnings"]
+        self.assertEqual(len(w), 4, w)
+        self.assertIn("other 2 audio stream(s) are not in the output", w[0])
+        self.assertIn("pads it with silence", w[1])
+        self.assertIn("starts +0.100s from its video", w[2])
+        self.assertIn("silent track", w[3])
+        self.assertEqual((doc["input"]["audio_stream_count"], doc["parameters"]["drop_other_audio"]), (3, True))
+
+    def test_dropped_subtitles_are_reported(self):
+        doc = remux(RemuxRequest(self.video, self.stem, self.out), skill=RemuxStub(mode="dropped"))
+        self.assertIn("subtitle or data streams", doc["warnings"][0])
+        self.assertTrue(doc["steps"][0]["result"]["dropped_non_av_streams"])
+
+    def test_output_failing_validation_writes_nothing(self):
+        for mode, words in (("frames", "29 video frames, expected 30"), ("codec", "video codec 'mpeg4'"),
+                            ("two_audio", "1 video and 2 audio"), ("short", "duration 0.500s")):
+            with self.assertRaises(VoiceEnhanceError) as e:
+                remux(RemuxRequest(self.video, self.stem, self.out), skill=RemuxStub(mode=mode))
+            self.assertEqual(e.exception.code, "INVALID_RESULT", mode)
+            self.assertIn(words, e.exception.message)
+            self.assertFalse(os.path.exists(self.out))
+            self.assert_no_leftovers()
+
+    def test_overwrite(self):
+        Path(self.out).write_bytes(b"old")
+        doc = remux(RemuxRequest(self.video, self.stem, self.out, overwrite=True), skill=RemuxStub())
+        self.assertEqual((doc["ok"], json.loads(Path(self.out).read_text(encoding="utf-8"))["payload"]), (True, "picture-0123"))
+
+    @unittest.skipUnless(POSIX, "the fake deep-filter is a shell script")
+    def test_isolate_then_remux(self):
+        """The pipeline step 6 exists for: ISOLATE's stem back under the picture it came from."""
+        skill = RemuxStub()
+        noisy = os.path.join(self.tmp, "noisy.wav")
+        voice_noise_fixture(noisy, seconds=1.001)
+        engine_dir = os.path.join(self.tmp, "engine")
+        os.mkdir(engine_dir)
+        stem = os.path.join(self.tmp, "stem.wav")
+        with env(VOICE_ENHANCE_DEEP_FILTER=fake_deep_filter(engine_dir, mode="lowpass"), VOICE_ENHANCE_DFN_MODEL=fake_model(engine_dir)):
+            isolate(IsolateRequest(noisy, stem), skill=skill)
+        with mock.patch("voice_enhance_skill.ops.FfmpegSkill.locate", return_value=skill):
+            rc, doc = run_cli("remux", self.video, stem, "-o", self.out, "--json")
+        self.assertEqual((rc, doc["ok"], doc["output"]["audio"]["channels"], doc["warnings"]), (0, True, 1, []), doc)
+        self.assertEqual(json.loads(Path(self.out).read_text(encoding="utf-8"))["payload"], "picture-0123")
+        self.assert_no_leftovers()
+
 
 class FfmpegSkillContractTests(unittest.TestCase):
     def doc(self, drop=None):
@@ -1255,6 +1480,8 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual({op: o["implemented"] for op, o in d["checks"]["operations"].items()},
                          {"isolate": True, "dereverb": True, "bleed_reduce": True})
         self.assertEqual(d["checks"]["operations"]["bleed_reduce"]["engine"], "crosstalk")
+        self.assertEqual(d["checks"]["helpers"], {"remux": {"implemented": True, "roadmap_step": 6, "ffmpeg_skill_tool": "audio --replace",
+                                                            "ready": False}})
         self.assertEqual((rc, cli_doc["status"], cli_doc["offline"]), (1, "fail", True))
 
     def test_engines_command(self):
@@ -1281,6 +1508,9 @@ class ProvenanceTests(unittest.TestCase):
             self.assertEqual((many["inputs"], many["outputs"]), ([{"sha256": sha256_file(a)}, {"sha256": sha256_file(b)}],
                                                                  [{"sha256": sha256_file(b)}, {"sha256": sha256_file(a)}]))
             self.assertNotIn("input", many)
+            none = build_provenance(op="remux", engine=None, input_path=[a, b], output_path=[a], parameters={})
+            self.assertIsNone(none["engine"])
+            self.assertEqual(none["outputs"], [{"sha256": sha256_file(a)}])
 
 
 @unittest.skipUnless(OS_DIR, "needs an AI-video-production-OS checkout (AI_VIDEO_PRODUCTION_OS_DIR or ../AI-video-production-OS)")
