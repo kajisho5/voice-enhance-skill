@@ -1,5 +1,5 @@
 """Running an engine: the worker subprocess with a timeout that kills its process group. The ops (ISOLATE,
-DEREVERB, BLEED_REDUCE; roadmap steps 3-5) wrap this with ffmpeg-skill probing, format conversion and validation."""
+DEREVERB, BLEED_REDUCE; roadmap steps 3-5, ADR-003 to ADR-005) wrap this with ffmpeg-skill probing, format conversion and validation."""
 from __future__ import annotations
 
 import json

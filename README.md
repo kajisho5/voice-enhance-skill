@@ -17,13 +17,13 @@
 
 AI voice isolation, dereverberation and mic-bleed reduction for recorded speech, for the [AI Video Production OS](https://github.com/kajisho5/AI-video-production-OS) (department 音 / Audio). Local and offline: engines are optional, never downloaded by the skill, and every media step (probe, format conversion, putting the cleaned audio back into the video) goes through [ffmpeg-skill](https://github.com/kajisho5/ffmpeg-skill).
 
-**Status: 0.1.0, unreleased.** `isolate` ([ADR-003](docs/decisions.md)) and `dereverb` ([ADR-004](docs/decisions.md)) work (`EXPERIMENTAL`). `contract`, `doctor` and `engines` work. `bleed-reduce` is declared (`PROPOSED`) and arrives in [roadmap](ECOSYSTEM_ROADMAP.md) step 5.
+**Status: 0.1.0, unreleased.** `isolate` ([ADR-003](docs/decisions.md)), `dereverb` ([ADR-004](docs/decisions.md)) and `bleed-reduce` ([ADR-005](docs/decisions.md)) work (`EXPERIMENTAL`). `contract`, `doctor` and `engines` work. Next on the [roadmap](ECOSYSTEM_ROADMAP.md): step 6, putting the cleaned audio back into the video.
 
 | Op | Capability | Engine ([ADR-001](docs/decisions.md)) | Licence (code / weights) | Step |
 |---|---|---|---|---|
 | ISOLATE | `voice.isolate` | DeepFilterNet3 via the standalone `deep-filter` binary (no PyTorch) | MIT OR Apache-2.0 / same | 3 (done) |
 | DEREVERB | `voice.dereverb` | nara_wpe (WPE, signal processing) | MIT / no weights | 4 (done) |
-| BLEED_REDUCE | `voice.bleed_reduce` | none: a weight-free method, decided in step 5 | - | 5 |
+| BLEED_REDUCE | `voice.bleed_reduce` | `crosstalk`: this repository's linear cross-talk demixing on NumPy, no AI model ([ADR-005](docs/decisions.md)) | MIT / no weights | 5 (done) |
 
 Traditional noise reduction, loudness and mixing belong to [audio-production-skill](https://github.com/kajisho5/audio-production-skill), not here.
 
@@ -36,6 +36,8 @@ voice-enhance isolate talk.mp4 -o talk_voice.wav --json            # voice stem 
 voice-enhance isolate talk.mp4 -o voice.wav --audio-stream 1 --atten-lim-db 20 --json
 voice-enhance dereverb talk.mp4 -o talk_dry.wav --json          # reverb removed (WPE), same rate and channels, float WAV
 voice-enhance dereverb hall.wav -o hall_dry.wav --taps 15 --iterations 5 --json
+voice-enhance bleed-reduce panel.mkv -o clean/ --json          # every audio stream is one mic; one float WAV per mic
+voice-enhance bleed-reduce lav_a.wav lav_b.wav -o clean/ --dominance-db 6 --json
 ```
 
 ## isolate
@@ -48,10 +50,19 @@ The engine needs 48 kHz. A stream at another rate is converted only when the ffm
 
 `dereverb` removes late reverberation from one audio stream (`--audio-stream`, default 0) with WPE (nara_wpe). WPE works at any sample rate and on any number of channels, so ffmpeg-skill extracts the stream as PCM WAV in a single `audio` pass. There is no fold-down and no resampling, so a 44.1 kHz stereo stream comes back as 44.1 kHz stereo and every channel helps predict the others. The engine runs a 32 ms / 8 ms STFT at the file's own rate and WPE on 30 s blocks, so memory does not grow with the length of the file. The result is a 32-bit float WAV with the input's rate, channels and length, sample-aligned with it, so nothing is clipped. It is checked through ffmpeg-skill/probe before it is renamed into place. `--taps` (default 10), `--delay` (3) and `--iterations` (3) are nara_wpe's parameters. `--delay` frames of direct sound and early reflections are always kept. The input is never modified, and `--overwrite` and `--timeout` work as for `isolate`.
 
+## bleed-reduce
+
+`bleed-reduce` takes 2 to 8 time-aligned microphone tracks and removes from each one what it picked up of the other talkers. A track is one audio stream. With one input, its audio streams are the tracks (all of them, or `--audio-streams 0,2`). With several inputs, each input is one track (stream 0, or one `--audio-streams` entry per input). Each track is prepared through ffmpeg-skill like `isolate`'s input: one `audio --audio-stream` pass, and a second `--mono` pass if it has more than one channel. All tracks must share the first track's sample rate. A different rate needs ffmpeg-skill `audio --sample-rate`, and without it the op stops with `FFMPEG_SKILL_UNAVAILABLE` before doing any work.
+
+The `crosstalk` engine is signal processing on NumPy, with no model and no weights. It measures, per frequency, how strongly each microphone hears each other talker. It measures this only where that talker is louder than the microphone's own by `--dominance-db` (default 3). It then undoes that mixing with one linear demix per frequency. Nothing is gated or generated, and a track's own voice is left as it was. The measured couplings are in `parameters.coupling_db`. A pair that could not be measured (a talker who never speaks alone) is `null` and gets a warning; nothing of it is removed.
+
+Each track is written to `<out_dir>/<input name>_a<stream>.wav` as mono 32-bit float, with its own length and sample-aligned with its input. Every stem is checked through ffmpeg-skill/probe before any is placed. A new output directory appears whole or not at all. In an existing one no file is replaced without `--overwrite`. The op does not align tracks: separately recorded tracks have to be lined up first (ffmpeg-skill `sync`), and a length difference gives a warning. Two microphones on the two channels of one stream cannot be separated, because ffmpeg-skill has no channel-select flag yet, so such a stream is folded down to one track (with a warning). `--timeout` works as for `isolate`.
+
 ## Engines (optional)
 
 - **DeepFilterNet3** (ISOLATE): download `deep-filter` for your platform and `DeepFilterNet3_onnx.tar.gz` from the [DeepFilterNet releases](https://github.com/Rikorose/DeepFilterNet/releases) (v0.5.x). Put `deep-filter` on `PATH` (or set `VOICE_ENHANCE_DEEP_FILTER`) and set `VOICE_ENHANCE_DFN_MODEL` to the model tarball.
 - **nara_wpe** (DEREVERB): `pip install -e '.[wpe]'`.
+- **crosstalk** (BLEED_REDUCE): part of this package; it needs NumPy, `pip install -e '.[bleed]'`.
 
 `doctor` reports each engine `OK`, `MISSING` or `INCOMPATIBLE` (version outside the supported range). Engines run in a worker subprocess in their own process group, killed on `--timeout`.
 
@@ -69,7 +80,7 @@ With `--json`, stdout holds exactly one JSON document. Failures are `{"ok": fals
 python -m unittest discover -s tests -v
 ```
 
-Unit tests need no engine, no weights and no FFmpeg (fake `deep-filter`, a fake `nara_wpe` package, mocked package lookups, a stdlib stub of ffmpeg-skill for both ops). The ISOLATE SNR check runs on a synthetic voice+noise fixture. The DEREVERB check (signal-to-reverberation ratio) runs on a synthetic reverberant fixture and needs NumPy, because the fake nara_wpe computes on it; it is skipped without NumPy. The real-engine versions run only where the engine is installed. The integration tests run against a real ffmpeg-skill checkout (`VOICE_ENHANCE_FFMPEG_SKILL_DIR` or `../ffmpeg-skill`) and FFmpeg; the OS registry conformance checks run when `AI_VIDEO_PRODUCTION_OS_DIR` (or `../AI-video-production-OS`) is present.
+Unit tests need no engine, no weights and no FFmpeg (fake `deep-filter`, a fake `nara_wpe` package, mocked package lookups, a stdlib stub of ffmpeg-skill for every op). The ISOLATE SNR check runs on a synthetic voice+noise fixture. The DEREVERB check (signal-to-reverberation ratio) runs on a synthetic reverberant fixture and needs NumPy, because the fake nara_wpe computes on it. The BLEED_REDUCE check (cross-talk energy) runs on a synthetic two-microphone fixture and needs NumPy, because the crosstalk engine computes on it. Both are skipped without NumPy. The real-engine versions run only where the engine is installed. The integration tests run against a real ffmpeg-skill checkout (`VOICE_ENHANCE_FFMPEG_SKILL_DIR` or `../ffmpeg-skill`) and FFmpeg; the OS registry conformance checks run when `AI_VIDEO_PRODUCTION_OS_DIR` (or `../AI-video-production-OS`) is present.
 
 ## Licence
 

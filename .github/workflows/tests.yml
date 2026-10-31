@@ -36,7 +36,7 @@ jobs:
     # Real FFmpeg from apt, plus read-only checkouts of ffmpeg-skill main (the live contract and probe) and
     # AI-video-production-OS (registry conformance checks). No engine and no weights are installed (ADR-001), so
     # nothing may skip here. NumPy is installed because the fake nara_wpe of the DEREVERB tests computes on it
-    # (ADR-004); nara_wpe itself is not.
+    # (ADR-004), and so does the crosstalk engine of BLEED_REDUCE (ADR-005); nara_wpe itself is not.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

@@ -9,7 +9,8 @@ from .doctor import DOCTOR_SCHEMA, IMPLEMENTED_OPS, OP_STEP
 from .engines import DEFAULT_ENGINE, engine_ids, get_engine
 from .errors import ERROR_TABLE
 from .ffmpeg_skill import FLAGS_USED, OPTIONAL_FLAGS, SUPPORTED_CONTRACT_VERSION, TOOLS_USED
-from .ops import DEREVERB_SCHEMA, ISOLATE_RATE, ISOLATE_SCHEMA
+from .engines.crosstalk import DEFAULTS as CROSSTALK_DEFAULTS, MAX_TRACKS, MIN_TRACKS
+from .ops import BLEED_REDUCE_SCHEMA, DEREVERB_SCHEMA, ISOLATE_RATE, ISOLATE_SCHEMA
 
 CONTRACT_VERSION = "1.0"
 CAPABILITY_IDS = {"isolate": "voice.isolate", "dereverb": "voice.dereverb", "bleed_reduce": "voice.bleed_reduce"}
@@ -33,8 +34,20 @@ _OP_TOOLS = {
                             "alignment": "sample-aligned with the input (WPE subtracts a prediction; no delay is added)"},
                  "result_keys": ["schema", "ok", "op", "capability", "skill", "output", "input", "engine", "parameters", "steps",
                                  "provenance", "warnings"]},
-    "bleed_reduce": {"description": "Per-microphone tracks with cross-talk from the other microphones reduced",
-                     "argv": ["bleed-reduce", "<track.wav>...", "-o <out_dir>", "[--timeout 3600]", "[--overwrite]", "--json"]},
+    "bleed_reduce": {"description": "Per-microphone tracks with cross-talk from the other microphones reduced (signal processing, "
+                                    "no model weights)",
+                     "argv": ["bleed-reduce", "<media>...", "-o <out_dir>", "[--audio-streams 0,1]", "[--engine crosstalk]",
+                              f"[--dominance-db {CROSSTALK_DEFAULTS['dominance_db']:g}]", "[--timeout 3600]", "[--overwrite]",
+                              "[--ffmpeg-skill <dir>]", "[--offline]", "--json"],
+                     "schema": BLEED_REDUCE_SCHEMA,
+                     "input": {"tracks": f"{MIN_TRACKS}-{MAX_TRACKS} time-aligned microphone tracks: the audio streams of one file "
+                                         "(all, or --audio-streams), or one stream per file (stream 0, or one --audio-streams "
+                                         "entry per file)", "sample_rate": "one rate for all tracks (the first track's)"},
+                     "output": {"format": "wav", "codec": "pcm_f32le", "files": "one per track: <out_dir>/<input name>_a<stream>.wav",
+                                "sample_rate": "the first track's", "channels": 1,
+                                "alignment": "sample-aligned with each input (linear per-bin demixing; no delay is added)"},
+                     "result_keys": ["schema", "ok", "op", "capability", "skill", "output_dir", "outputs", "inputs", "engine",
+                                     "parameters", "steps", "provenance", "warnings"]},
 }
 
 
@@ -94,7 +107,8 @@ def contract() -> Dict[str, Any]:
                     "optional": True,
                     "statuses": ["OK", "MISSING", "INCOMPATIBLE"]},
         "provenance": {"fields": ["skill", "op", "engine.id", "engine.version", "engine.model", "engine.model_sha256", "engine.code_license",
-                                  "engine.weights_license", "engine.attribution", "input.sha256", "output.sha256", "parameters",
+                                  "engine.weights_license", "engine.attribution", "input.sha256", "output.sha256",
+                                  "inputs[].sha256 (bleed_reduce)", "outputs[].sha256 (bleed_reduce)", "parameters",
                                   "ffmpeg_skill.version", "network"],
                        "status": "OBSERVED"},
         "execution": {"canonical_invocation": ["voice-enhance", "<command>", "...", "--json"], "network": False, "shell": False,

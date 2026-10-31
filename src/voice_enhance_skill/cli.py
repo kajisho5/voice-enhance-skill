@@ -14,8 +14,10 @@ Exit code: 0 on success; doctor exits 1 when its status is `fail`; an error exit
                                     one audio stream with late reverberation removed (WPE), same rate and channels,
                                     32-bit float WAV (ADR-004) [--audio-stream N] [--engine nara_wpe] [--taps N]
                                     [--delay N] [--iterations N] [--timeout S] [--overwrite] [--ffmpeg-skill DIR] [--offline]
-
-bleed-reduce arrives in roadmap step 5."""
+  voice-enhance bleed-reduce <media>... -o <out_dir> --json
+                                    microphone tracks with the other mics' cross-talk reduced, one mono 32-bit float WAV
+                                    per track (ADR-005) [--audio-streams 0,1] [--engine crosstalk] [--dominance-db N]
+                                    [--timeout S] [--overwrite] [--ffmpeg-skill DIR] [--offline]"""
 from __future__ import annotations
 
 import argparse
@@ -27,8 +29,9 @@ from . import PACKAGE_NAME, SKILL_ID, __version__
 from .contract import contract
 from .doctor import doctor, engines_report
 from .errors import VoiceEnhanceError
+from .engines.crosstalk import DEFAULTS as CROSSTALK_DEFAULTS, LIMITS as CROSSTALK_LIMITS, MAX_TRACKS
 from .engines.nara_wpe_engine import DEFAULTS as WPE_DEFAULTS, LIMITS as WPE_LIMITS
-from .ops import DereverbRequest, IsolateRequest, dereverb, isolate
+from .ops import BleedReduceRequest, DereverbRequest, IsolateRequest, bleed_reduce, dereverb, isolate
 from .service import DEFAULT_TIMEOUT
 
 
@@ -73,7 +76,31 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--ffmpeg-skill", help="ffmpeg-skill checkout directory")
     r.add_argument("--offline", action="store_true", help="no network (every registered engine already needs none)")
     r.add_argument("--json", action="store_true")
+    b = sub.add_parser("bleed-reduce", help="microphone tracks with the other mics' cross-talk reduced (signal processing, no weights); "
+                       "one mono 32-bit float WAV per track")
+    b.add_argument("inputs", nargs="+", help=f"media files (never modified): one file with 2-{MAX_TRACKS} audio streams, or one file "
+                   "per microphone; the tracks must be time-aligned")
+    b.add_argument("-o", "--output", required=True, help="output directory (created if missing); one <input name>_a<stream>.wav "
+                   "per track, none replaced unless --overwrite")
+    b.add_argument("--audio-streams", type=_int_list, help="which audio streams, 0-based, comma-separated: with one input, the "
+                   "tracks (default: all of its streams); with several inputs, one per input (default: stream 0 of each)")
+    b.add_argument("--engine", help="engine id (default: crosstalk)")
+    lo, hi = CROSSTALK_LIMITS["dominance_db"]
+    b.add_argument("--dominance-db", type=float, help=f"how much louder a track must be than another for a bin to count as its "
+                   f"talker when the bleed is measured, {lo:g}-{hi:g} dB (default {CROSSTALK_DEFAULTS['dominance_db']:g})")
+    b.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help=f"engine time limit in seconds (default {DEFAULT_TIMEOUT:g})")
+    b.add_argument("--overwrite", action="store_true", help="allow replacing existing outputs")
+    b.add_argument("--ffmpeg-skill", help="ffmpeg-skill checkout directory")
+    b.add_argument("--offline", action="store_true", help="no network (every registered engine already needs none)")
+    b.add_argument("--json", action="store_true")
     return ap
+
+
+def _int_list(text: str) -> List[int]:
+    try:
+        return [int(v) for v in text.split(",") if v.strip() != ""]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected comma-separated integers, got {text!r}")
 
 
 def _emit(doc: Dict[str, Any], as_json: bool) -> None:
@@ -88,6 +115,12 @@ def _human(doc: Dict[str, Any]) -> None:
     if doc.get("error"):
         err = doc["error"]
         sys.stderr.write(f"error [{err['code']}]: {err['message']}\n")
+    elif "op" in doc and "outputs" in doc:
+        e = doc["engine"]
+        for o in doc["outputs"]:
+            print(f"wrote {o['path']} ({o['duration']:.2f}s, {o['sample_rate']} Hz, {o['channels']} ch) with {e['id']} {e['version']}")
+        for w in doc.get("warnings", []):
+            print(f"  warning: {w}")
     elif "op" in doc and "output" in doc:
         o, e = doc["output"], doc["engine"]
         print(f"wrote {o['path']} ({o['duration']:.2f}s, {o['sample_rate']} Hz, {o['channels']} ch) with {e['id']} {e['version']}")
@@ -138,6 +171,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                                            engine=args.engine, timeout=args.timeout, overwrite=args.overwrite, taps=args.taps,
                                            delay=args.delay, iterations=args.iterations, ffmpeg_skill_dir=args.ffmpeg_skill,
                                            offline=args.offline)), as_json)
+            return 0
+        if args.cmd == "bleed-reduce":
+            _emit(bleed_reduce(BleedReduceRequest(input_paths=args.inputs, output_dir=args.output, audio_streams=args.audio_streams,
+                                                  engine=args.engine, timeout=args.timeout, overwrite=args.overwrite,
+                                                  dominance_db=args.dominance_db, ffmpeg_skill_dir=args.ffmpeg_skill,
+                                                  offline=args.offline)), as_json)
             return 0
     except VoiceEnhanceError as e:
         _emit({"ok": False, "skill": {"id": SKILL_ID, "version": __version__}, "error": e.to_dict()}, as_json)

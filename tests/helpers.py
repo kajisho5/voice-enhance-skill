@@ -1,5 +1,6 @@
-"""Shared test helpers: paths, the CLI runner, a fake `deep-filter` executable, WAV writers and readers, the synthetic
-voice+noise fixture and an SNR measure. Nothing here is part of the package; the fake binary is never registered
+"""Shared test helpers: paths, the CLI runner, a fake `deep-filter` executable, a fake `nara_wpe` package, WAV writers
+and readers, the synthetic fixtures (voice+noise for ISOLATE, reverberant for DEREVERB, two-microphone cross-talk for
+BLEED_REDUCE) and their measures. Nothing here is part of the package; the fake binary is never registered
 anywhere but a test's environment."""
 from __future__ import annotations
 
@@ -345,3 +346,55 @@ def reverb_fixture(path: str, seconds: float = 1.0, rate: int = 16000, channels:
 
 
 srr_db = snr_db     # the reverberation is the "noise": SRR is the SNR of a signal against its direct path
+
+
+def write_wav_tracks(path: str, tracks: List[List[float]], rate: int = 48000) -> str:
+    """16-bit PCM with one channel per track (each in [-1, 1]); a shorter track is padded with zeros."""
+    n = max(len(t) for t in tracks)
+    with wave.open(path, "wb") as w:
+        w.setnchannels(len(tracks))
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"".join(struct.pack("<h", max(-32768, min(32767, int(round((t[i] if i < len(t) else 0.0) * 32767)))))
+                               for i in range(n) for t in tracks))
+    return path
+
+
+def read_wav_channels(path: str) -> Tuple[int, List[List[float]]]:
+    """(sample rate, one list per channel) for 16-bit PCM WAV."""
+    with wave.open(path, "rb") as w:
+        rate, ch, n = w.getframerate(), w.getnchannels(), w.getnframes()
+        vals = [v / 32768.0 for v in struct.unpack(f"<{n * ch}h", w.readframes(n))]
+    return rate, [vals[c::ch] for c in range(ch)]
+
+
+CROSSTALK_LEAK_DB = -8.0        # how loud each talker is in the other microphone, relative to its own
+CROSSTALK_DELAY_MS = 4.0        # and how much later it arrives there (about 1.4 m further away)
+
+
+def crosstalk_fixture(seconds: float = 2.0, rate: int = 16000, leak_db: float = CROSSTALK_LEAK_DB,
+                      delay_ms: float = CROSSTALK_DELAY_MS, seed: int = 3) -> Dict[str, Any]:
+    """The synthetic two-microphone fixture for BLEED_REDUCE. Talker 0 speaks in the first 60 % of the time and talker
+    1 in the last 60 % (they overlap in the middle fifth). Each microphone hears its own talker plus the other one at
+    `leak_db`, `delay_ms` later, plus a faint independent noise floor (-60 dB). Returns {"mics": [mic0, mic1] scaled
+    to a 0.5 peak, "rate", "own": [region of track 0's own talker alone, region of track 1's], "other": [region of
+    the other talker alone in track 0, in track 1]}, regions as (start, end) in seconds. Cross-talk energy is a
+    track's energy where only the other talker speaks; its own speech is its energy where only its own talker does."""
+    rng = random.Random(seed)
+    n, d, g = int(seconds * rate), int(delay_ms * rate / 1000), 10 ** (leak_db / 20)
+    lo1, hi0 = 0.4 * seconds, 0.6 * seconds
+    t0 = [v if i < hi0 * rate else 0.0 for i, v in enumerate(syllables(seconds, rate, seed=5))]
+    t1 = [v if i >= lo1 * rate else 0.0 for i, v in enumerate(syllables(seconds, rate, seed=11))]
+    mic0 = [t0[i] + g * (t1[i - d] if i >= d else 0.0) + 0.001 * rng.gauss(0, 1) for i in range(n)]
+    mic1 = [t1[i] + g * (t0[i - d] if i >= d else 0.0) + 0.001 * rng.gauss(0, 1) for i in range(n)]
+    scale = 0.5 / max(max(abs(v) for v in mic0), max(abs(v) for v in mic1))
+    # the regions keep 50 ms away from where a talker starts or stops, so the delayed bleed has arrived / faded
+    edge = 0.05
+    return {"mics": [[v * scale for v in mic0], [v * scale for v in mic1]], "rate": rate,
+            "own": [(0.0, lo1 - edge), (hi0 + edge, seconds)], "other": [(hi0 + edge, seconds), (0.0, lo1 - edge)]}
+
+
+def energy_db(samples: List[float], rate: int, region: Tuple[float, float]) -> float:
+    """Energy of `samples` within `region` (seconds), in dB."""
+    part = samples[int(region[0] * rate):int(region[1] * rate)]
+    return 10 * math.log10(max(sum(v * v for v in part), 1e-20))
