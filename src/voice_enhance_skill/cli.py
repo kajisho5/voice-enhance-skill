@@ -10,8 +10,12 @@ Exit code: 0 on success; doctor exits 1 when its status is `fail`; an error exit
                                     voice stem of one audio stream, 48 kHz mono WAV (ADR-003) [--audio-stream N]
                                     [--engine deepfilternet] [--atten-lim-db N] [--timeout S] [--overwrite]
                                     [--ffmpeg-skill DIR] [--offline]
+  voice-enhance dereverb <media> -o <out.wav> --json
+                                    one audio stream with late reverberation removed (WPE), same rate and channels,
+                                    32-bit float WAV (ADR-004) [--audio-stream N] [--engine nara_wpe] [--taps N]
+                                    [--delay N] [--iterations N] [--timeout S] [--overwrite] [--ffmpeg-skill DIR] [--offline]
 
-dereverb and bleed-reduce arrive in roadmap steps 4-5."""
+bleed-reduce arrives in roadmap step 5."""
 from __future__ import annotations
 
 import argparse
@@ -23,7 +27,8 @@ from . import PACKAGE_NAME, SKILL_ID, __version__
 from .contract import contract
 from .doctor import doctor, engines_report
 from .errors import VoiceEnhanceError
-from .ops import IsolateRequest, isolate
+from .engines.nara_wpe_engine import DEFAULTS as WPE_DEFAULTS, LIMITS as WPE_LIMITS
+from .ops import DereverbRequest, IsolateRequest, dereverb, isolate
 from .service import DEFAULT_TIMEOUT
 
 
@@ -53,6 +58,21 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("--ffmpeg-skill", help="ffmpeg-skill checkout directory")
     i.add_argument("--offline", action="store_true", help="no network (every registered engine already needs none)")
     i.add_argument("--json", action="store_true")
+    r = sub.add_parser("dereverb", help="one audio stream with room reverberation reduced (WPE, nara_wpe); same rate and channels, "
+                       "32-bit float WAV")
+    r.add_argument("input", help="media file (video or audio); never modified")
+    r.add_argument("-o", "--output", required=True, help="output .wav (refused if it exists, unless --overwrite)")
+    r.add_argument("--audio-stream", type=int, default=0, help="which audio stream, 0-based in file order (default 0)")
+    r.add_argument("--engine", help="engine id (default: nara_wpe)")
+    for key, what in (("taps", "prediction filter length in STFT frames"), ("delay", "frames skipped before the prediction "
+                      "starts (direct sound and early reflections are kept)"), ("iterations", "WPE iterations")):
+        lo, hi = WPE_LIMITS[key]
+        r.add_argument(f"--{key}", type=int, help=f"{what}, {lo}-{hi} (default {WPE_DEFAULTS[key]})")
+    r.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help=f"engine time limit in seconds (default {DEFAULT_TIMEOUT:g})")
+    r.add_argument("--overwrite", action="store_true", help="allow replacing an existing output")
+    r.add_argument("--ffmpeg-skill", help="ffmpeg-skill checkout directory")
+    r.add_argument("--offline", action="store_true", help="no network (every registered engine already needs none)")
+    r.add_argument("--json", action="store_true")
     return ap
 
 
@@ -112,6 +132,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                                          engine=args.engine, timeout=args.timeout, overwrite=args.overwrite,
                                          atten_lim_db=args.atten_lim_db, ffmpeg_skill_dir=args.ffmpeg_skill,
                                          offline=args.offline)), as_json)
+            return 0
+        if args.cmd == "dereverb":
+            _emit(dereverb(DereverbRequest(input_path=args.input, output_path=args.output, audio_stream=args.audio_stream,
+                                           engine=args.engine, timeout=args.timeout, overwrite=args.overwrite, taps=args.taps,
+                                           delay=args.delay, iterations=args.iterations, ffmpeg_skill_dir=args.ffmpeg_skill,
+                                           offline=args.offline)), as_json)
             return 0
     except VoiceEnhanceError as e:
         _emit({"ok": False, "skill": {"id": SKILL_ID, "version": __version__}, "error": e.to_dict()}, as_json)

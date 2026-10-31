@@ -215,3 +215,133 @@ def write_tone_wav(path: str, seconds: float = 1.0, rate: int = 48000, freq: flo
         w.setframerate(rate)
         w.writeframes(b"".join(struct.pack("<h", int(8000 * math.sin(2 * math.pi * freq * i / rate))) for i in range(n)))
     return path
+
+
+# The fake `nara_wpe` package (DEREVERB, ADR-004): nara_wpe/wpe.py with wpe_v8, plus a dist-info so the engine's
+# version check reads 0.0.11. It records each call (shape and parameters) to calls.json next to the package, then,
+# per mode:
+#   wpe        a minimal WPE on NumPy (per frequency: delayed-frame stack, power-weighted least squares, subtract the
+#              prediction), so the reverberant fixture really gets drier
+#   identity   returns Y unchanged (the STFT round trip must give the input back, sample-aligned)
+#   fail       raises RuntimeError
+#   badshape   returns an array of the wrong shape
+FAKE_WPE_PROGRAM = r'''
+import json, os
+import numpy as np
+MODE = __MODE__
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def wpe_v8(Y, taps=10, delay=3, iterations=3, psd_context=0, statistics_mode="full", inplace=False):
+    path = os.path.join(HERE, "calls.json")
+    calls = json.load(open(path)) if os.path.exists(path) else []
+    calls.append({"shape": list(Y.shape), "dtype": str(Y.dtype), "taps": taps, "delay": delay, "iterations": iterations,
+                  "statistics_mode": statistics_mode})
+    json.dump(calls, open(path, "w"))
+    if MODE == "fail":
+        raise RuntimeError("fake nara_wpe failed")
+    if MODE == "badshape":
+        return Y[..., :-1]
+    if MODE == "identity":
+        return Y.copy()
+    F, D, T = Y.shape
+    X = np.empty_like(Y)
+    for f in range(F):
+        y = Y[f]
+        yt = np.zeros((taps * D, T), dtype=Y.dtype)
+        for k in range(taps):
+            s = delay + k
+            if s < T:
+                yt[k * D:(k + 1) * D, s:] = y[:, :T - s]
+        x = y
+        for _ in range(iterations):
+            w = yt / np.maximum(np.mean(np.abs(x) ** 2, axis=0), 1e-10)
+            r = w @ yt.conj().T
+            r += (1e-6 * np.trace(r).real / len(r) + 1e-12) * np.eye(len(r))   # identical channels are singular
+            g = np.linalg.solve(r, w @ y.conj().T)
+            x = y - g.conj().T @ yt
+        X[f] = x
+    return X
+'''
+
+
+def fake_nara_wpe(directory: str, mode: str = "wpe", version: str = "0.0.11") -> str:
+    """A directory to put on sys.path / PYTHONPATH that holds the fake `nara_wpe` package; returns it."""
+    root = os.path.join(directory, "fake_site")
+    pkg = os.path.join(root, "nara_wpe")
+    os.makedirs(pkg, exist_ok=True)
+    Path(pkg, "__init__.py").write_text("", encoding="utf-8")
+    Path(pkg, "wpe.py").write_text(FAKE_WPE_PROGRAM.replace("__MODE__", repr(mode)), encoding="utf-8")
+    dist = os.path.join(root, f"nara_wpe-{version}.dist-info")
+    os.makedirs(dist, exist_ok=True)
+    Path(dist, "METADATA").write_text(f"Metadata-Version: 2.1\nName: nara_wpe\nVersion: {version}\n", encoding="utf-8")
+    return root
+
+
+def fake_wpe_calls(site: str) -> List[Dict[str, Any]]:
+    path = Path(site, "calls.json")
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+
+
+@contextmanager
+def on_python_path(directory: str) -> Iterator[None]:
+    """`directory` first on sys.path (this process) and on PYTHONPATH (the worker), with import caches reset on the
+    way in and out, so a fake package is found by the engine's checks and by the worker, and forgotten afterwards."""
+    import importlib
+    def forget() -> None:
+        for name in [m for m in sys.modules if m == "nara_wpe" or m.startswith("nara_wpe.")]:
+            del sys.modules[name]
+        importlib.invalidate_caches()
+    sys.path.insert(0, directory)
+    forget()
+    try:
+        with env(PYTHONPATH=os.pathsep.join([directory] + [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p])):
+            yield
+    finally:
+        sys.path.remove(directory)
+        forget()
+
+
+def have_numpy() -> bool:
+    import importlib.util
+    return importlib.util.find_spec("numpy") is not None
+
+
+def syllables(seconds: float, rate: int, seed: int = 5, breath: float = 0.3) -> List[float]:
+    """Speech-like dry signal for DEREVERB: syllables of 80-250 ms, each with its own fundamental (100-240 Hz, gliding
+    by up to 30 %), harmonics to the 6th, a little breath noise and a sine envelope, separated by 30-150 ms gaps. It
+    has to be non-stationary: WPE (correctly) treats a steady tone as predictable, i.e. as reverberation, so
+    voice_noise_fixture's steady 140 Hz voice would be removed along with the reverb."""
+    rng = random.Random(seed)
+    n = int(seconds * rate)
+    out = [0.0] * n
+    i = int(0.02 * rate)
+    while i < n:
+        length, f0, glide, phase = int(rng.uniform(0.08, 0.25) * rate), rng.uniform(100, 240), rng.uniform(-0.3, 0.3), 0.0
+        for k in range(min(length, n - i)):
+            phase += 2 * math.pi * f0 * (1 + glide * k / length) / rate
+            out[i + k] = math.sin(math.pi * k / length) * (sum(math.sin(h * phase) / h for h in range(1, 7)) + breath * rng.gauss(0, 1))
+        i += length + int(rng.uniform(0.03, 0.15) * rate)
+    return out
+
+
+REVERB_COMBS = ((0.037, 0.6), (0.059, 0.5))     # (delay in s, feedback gain): two feedback comb filters in series
+
+
+def reverb_fixture(path: str, seconds: float = 1.0, rate: int = 16000, channels: int = 1) -> List[float]:
+    """The synthetic reverberant fixture: syllables() through two feedback comb filters in series (37 ms / 0.6 and
+    59 ms / 0.5, a decaying echo tail whose inverse is a short prediction filter, the model WPE assumes). Writes the
+    reverberant signal and returns the dry signal at the same scale, so srr_db(dry, read_wav(x)) is the
+    signal-to-reverberation ratio of any processed version of it. O(n) pure Python."""
+    dry = syllables(seconds, rate)
+    wet = list(dry)
+    for delay, gain in REVERB_COMBS:
+        d = int(delay * rate)
+        for i in range(d, len(wet)):
+            wet[i] += gain * wet[i - d]
+    scale = 0.5 / max(abs(v) for v in wet)
+    write_wav(path, [v * scale for v in wet], rate, channels)
+    return [v * scale for v in dry]
+
+
+srr_db = snr_db     # the reverberation is the "noise": SRR is the SNR of a signal against its direct path

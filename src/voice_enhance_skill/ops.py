@@ -1,6 +1,6 @@
-"""The ops. ISOLATE (roadmap step 3, ADR-003) is implemented; DEREVERB and BLEED_REDUCE arrive in steps 4-5 and will
-reuse the same frame: checked paths, an engine that is OK, the input prepared through ffmpeg-skill, the engine in the
-worker subprocess, the result validated through ffmpeg-skill, then moved into place.
+"""The ops. ISOLATE (roadmap step 3, ADR-003) and DEREVERB (step 4, ADR-004) are implemented; BLEED_REDUCE arrives in
+step 5 and will reuse the same frame: checked paths, an engine that is OK, the input prepared through ffmpeg-skill, the
+engine in the worker subprocess, the result validated through ffmpeg-skill, then moved into place.
 
 ISOLATE, step by step:
   1. paths      the input is a regular file; the output is a .wav that is not the input and does not exist (unless
@@ -14,6 +14,10 @@ ISOLATE, step by step:
   6. validate   ffmpeg-skill/probe on the stem: 48 kHz, mono, same duration as the prepared input (else INVALID_RESULT)
   7. place      the stem replaces nothing unless --overwrite; it is renamed into place from a private run directory in
                 the output's own directory, so the output appears whole or not at all
+
+DEREVERB is the same frame with two differences (ADR-004): WPE works at any sample rate and on any number of channels,
+so step 4 is a single ffmpeg-skill/audio --audio-stream N pass (no fold-down, no resampling, so no audio --sample-rate
+is needed), and step 6 checks the stem against the prepared input's own rate and channel count.
 """
 from __future__ import annotations
 
@@ -26,12 +30,14 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import SKILL_ID, __version__
 from .engines import DEFAULT_ENGINE, engines_for, get_engine
 from .engines.base import OK, Engine, EngineRequest
+from .engines.nara_wpe_engine import LIMITS as WPE_LIMITS
 from .errors import VoiceEnhanceError
 from .ffmpeg_skill import FfmpegSkill
 from .provenance import build_provenance
 from .service import DEFAULT_TIMEOUT, run_engine
 
 ISOLATE_SCHEMA = f"{SKILL_ID}/isolate@1"
+DEREVERB_SCHEMA = f"{SKILL_ID}/dereverb@1"
 ISOLATE_RATE = 48000                 # deep-filter accepts 48 kHz WAV only (ADR-001)
 DURATION_TOLERANCE = 0.1             # seconds, or 1 % of the duration when that is larger
 PREPARED_NAME = "input.wav"
@@ -46,6 +52,21 @@ class IsolateRequest:
     timeout: float = DEFAULT_TIMEOUT
     overwrite: bool = False
     atten_lim_db: Optional[float] = None
+    ffmpeg_skill_dir: Optional[str] = None
+    offline: bool = False
+
+
+@dataclass
+class DereverbRequest:
+    input_path: str
+    output_path: str
+    audio_stream: int = 0
+    engine: Optional[str] = None
+    timeout: float = DEFAULT_TIMEOUT
+    overwrite: bool = False
+    taps: Optional[int] = None
+    delay: Optional[int] = None
+    iterations: Optional[int] = None
     ffmpeg_skill_dir: Optional[str] = None
     offline: bool = False
 
@@ -113,6 +134,15 @@ def _wav_facts(skill: FfmpegSkill, path: str, doc: Dict[str, Any]) -> Dict[str, 
     return skill.probe(path)
 
 
+def extract_stream(skill: FfmpegSkill, src: str, dst: str, audio_stream: int) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """ffmpeg-skill/audio <src> -o <dst.wav> --audio-stream N: that one stream as PCM WAV at its own rate and channel
+    count, the picture dropped. Returns (the WAV's probe, the step record)."""
+    facts = _wav_facts(skill, dst, skill.audio_to_wav(src, dst, audio_stream=audio_stream))
+    a = facts["audio"]
+    return facts, {"tool": "ffmpeg-skill/audio", "flags": ["--audio-stream", str(audio_stream)],
+                   "result": {"sample_rate": a.get("sample_rate"), "channels": a.get("channels")}}
+
+
 def prepare_wav(skill: FfmpegSkill, src: str, run_dir: str, audio_stream: int, rate: int,
                 stream: Dict[str, Any]) -> Tuple[str, Dict[str, Any], List[Dict[str, Any]], List[str]]:
     """One audio stream of `src` as a `rate` Hz mono PCM WAV in `run_dir`, through ffmpeg-skill/audio only.
@@ -127,13 +157,11 @@ def prepare_wav(skill: FfmpegSkill, src: str, run_dir: str, audio_stream: int, r
                                 f"the input to {rate} Hz first, or use an ffmpeg-skill release that declares audio --sample-rate",
                                 {"tool": "ffmpeg-skill/audio", "needs_flag": "sample_rate", "input_sample_rate": stream.get("sample_rate"),
                                  "required_sample_rate": rate})
-    steps: List[Dict[str, Any]] = []
     warnings: List[str] = []
     extracted = os.path.join(run_dir, "extracted.wav")
-    facts = _wav_facts(skill, extracted, skill.audio_to_wav(src, extracted, audio_stream=audio_stream))
+    facts, step = extract_stream(skill, src, extracted, audio_stream)
+    steps = [step]
     a = facts["audio"]
-    steps.append({"tool": "ffmpeg-skill/audio", "flags": ["--audio-stream", str(audio_stream)],
-                  "result": {"sample_rate": a.get("sample_rate"), "channels": a.get("channels")}})
     prepared = os.path.join(run_dir, PREPARED_NAME)
     mono = int(a.get("channels") or 0) != 1
     resample = int(a.get("sample_rate") or 0) != rate
@@ -155,8 +183,10 @@ def prepare_wav(skill: FfmpegSkill, src: str, run_dir: str, audio_stream: int, r
     return prepared, facts, steps, warnings
 
 
-def validate_output(skill: FfmpegSkill, path: str, rate: int, expected_duration: float, engine_id: str) -> Dict[str, Any]:
-    """The engine's stem through ffmpeg-skill/probe: readable, `rate` Hz, mono, as long as the prepared input."""
+def validate_output(skill: FfmpegSkill, path: str, rate: int, expected_duration: float, engine_id: str,
+                    channels: int = 1) -> Dict[str, Any]:
+    """The engine's stem through ffmpeg-skill/probe: readable, `rate` Hz, `channels` channels (ISOLATE: mono), as long
+    as the prepared input."""
     try:
         facts = skill.probe(path)
     except VoiceEnhanceError as e:
@@ -166,8 +196,8 @@ def validate_output(skill: FfmpegSkill, path: str, rate: int, expected_duration:
     problems = []
     if int(a.get("sample_rate") or 0) != rate:
         problems.append(f"sample rate {a.get('sample_rate')}, expected {rate}")
-    if int(a.get("channels") or 0) != 1:
-        problems.append(f"{a.get('channels')} channels, expected 1")
+    if int(a.get("channels") or 0) != channels:
+        problems.append(f"{a.get('channels')} channels, expected {channels}")
     duration = float(facts.get("duration") or 0.0)
     tolerance = max(DURATION_TOLERANCE, 0.01 * expected_duration)
     if abs(duration - expected_duration) > tolerance:
@@ -184,14 +214,48 @@ def _place(stem: str, dst: str, overwrite: bool) -> None:
     os.replace(stem, dst)
 
 
-def _check_numbers(req: IsolateRequest) -> None:
+def _check_common(req: Any) -> None:
     if not isinstance(req.timeout, (int, float)) or req.timeout <= 0:
         raise VoiceEnhanceError("INVALID_ARGUMENT", "--timeout must be > 0", {"timeout": req.timeout})
     if not isinstance(req.audio_stream, int) or req.audio_stream < 0:
         raise VoiceEnhanceError("INVALID_ARGUMENT", "--audio-stream must be an integer >= 0", {"audio_stream": req.audio_stream})
+
+
+def _check_numbers(req: IsolateRequest) -> None:
+    _check_common(req)
     if req.atten_lim_db is not None and not 0 < float(req.atten_lim_db) <= 100:
         raise VoiceEnhanceError("INVALID_ARGUMENT", "--atten-lim-db must be > 0 and <= 100 (100 = no limit)",
                                 {"atten_lim_db": req.atten_lim_db})
+
+
+def _usable_skill(skill: Optional[FfmpegSkill], directory: Optional[str], timeout: float) -> Tuple[FfmpegSkill, Any]:
+    if skill is None:
+        skill = FfmpegSkill.locate(directory, timeout=timeout)
+    info = skill.info()
+    if not info.supported:
+        raise VoiceEnhanceError("FFMPEG_SKILL_UNAVAILABLE", "ffmpeg-skill is not usable: " + "; ".join(info.problems),
+                                {"directory": str(info.directory), "problems": info.problems})
+    return skill, info
+
+
+def _run_dir(dst: str, output_path: str) -> str:
+    """A private run directory in the output's own directory, so the result is placed with one rename."""
+    try:
+        return tempfile.mkdtemp(prefix=".voice-enhance-", dir=os.path.dirname(dst))
+    except OSError as e:
+        raise VoiceEnhanceError("INVALID_ARGUMENT", f"cannot write to the output directory: {e}", {"output": output_path})
+
+
+def _input_doc(src: str, facts: Dict[str, Any], audio_stream: int, stream_count: int, stream: Dict[str, Any]) -> Dict[str, Any]:
+    return {"path": src, "duration": facts.get("duration"), "has_video": isinstance(facts.get("video"), dict),
+            "audio_stream": audio_stream, "audio_stream_count": stream_count,
+            "audio": {k: stream.get(k) for k in ("codec", "sample_rate", "channels", "channel_layout", "language")}}
+
+
+def _output_doc(dst: str, out_facts: Dict[str, Any]) -> Dict[str, Any]:
+    out_audio = out_facts.get("audio") or {}
+    return {"path": dst, "format": "wav", "codec": out_audio.get("codec"), "sample_rate": out_audio.get("sample_rate"),
+            "channels": out_audio.get("channels"), "duration": out_facts.get("duration")}
 
 
 def isolate(req: IsolateRequest, skill: Optional[FfmpegSkill] = None) -> Dict[str, Any]:
@@ -200,19 +264,10 @@ def isolate(req: IsolateRequest, skill: Optional[FfmpegSkill] = None) -> Dict[st
     _check_numbers(req)
     src, dst = check_paths(req.input_path, req.output_path, req.overwrite)
     engine, report = select_engine("isolate", req.engine, req.offline)
-    if skill is None:
-        skill = FfmpegSkill.locate(req.ffmpeg_skill_dir, timeout=float(req.timeout))
-    info = skill.info()
-    if not info.supported:
-        raise VoiceEnhanceError("FFMPEG_SKILL_UNAVAILABLE", "ffmpeg-skill is not usable: " + "; ".join(info.problems),
-                                {"directory": str(info.directory), "problems": info.problems})
-    name = os.path.basename(src)
+    skill, info = _usable_skill(skill, req.ffmpeg_skill_dir, float(req.timeout))
     facts = skill.probe(src)
-    stream, stream_count = select_stream(facts, req.audio_stream, name)
-    try:
-        run_dir = tempfile.mkdtemp(prefix=".voice-enhance-", dir=os.path.dirname(dst))
-    except OSError as e:
-        raise VoiceEnhanceError("INVALID_ARGUMENT", f"cannot write to the output directory: {e}", {"output": req.output_path})
+    stream, stream_count = select_stream(facts, req.audio_stream, os.path.basename(src))
+    run_dir = _run_dir(dst, req.output_path)
     try:
         prepared, prepared_facts, steps, warnings = prepare_wav(skill, src, run_dir, req.audio_stream, ISOLATE_RATE, stream)
         params: Dict[str, Any] = {"timeout": float(req.timeout)}
@@ -231,21 +286,76 @@ def isolate(req: IsolateRequest, skill: Optional[FfmpegSkill] = None) -> Dict[st
         _place(result.output_path, dst, req.overwrite)
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
-    out_audio = out_facts.get("audio") or {}
     return {
         "schema": ISOLATE_SCHEMA,
         "ok": True,
         "op": "isolate",
         "capability": "voice.isolate",
         "skill": {"id": SKILL_ID, "version": __version__},
-        "output": {"path": dst, "format": "wav", "codec": out_audio.get("codec"), "sample_rate": out_audio.get("sample_rate"),
-                   "channels": out_audio.get("channels"), "duration": out_facts.get("duration")},
-        "input": {"path": src, "duration": facts.get("duration"), "has_video": isinstance(facts.get("video"), dict),
-                  "audio_stream": req.audio_stream, "audio_stream_count": stream_count,
-                  "audio": {k: stream.get(k) for k in ("codec", "sample_rate", "channels", "channel_layout", "language")}},
+        "output": _output_doc(dst, out_facts),
+        "input": _input_doc(src, facts, req.audio_stream, stream_count, stream),
         "engine": {k: engine_doc.get(k) for k in ("id", "version", "model", "model_sha256")},
         "parameters": parameters,
         "steps": steps,
         "provenance": provenance,
         "warnings": warnings,
+    }
+
+
+def _check_dereverb(req: DereverbRequest) -> None:
+    _check_common(req)
+    for key in ("taps", "delay", "iterations"):
+        value = getattr(req, key)
+        lo, hi = WPE_LIMITS[key]
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or not lo <= value <= hi):
+            raise VoiceEnhanceError("INVALID_ARGUMENT", f"--{key} must be an integer from {lo} to {hi}", {key: value})
+
+
+def dereverb(req: DereverbRequest, skill: Optional[FfmpegSkill] = None) -> Dict[str, Any]:
+    """DEREVERB: one audio stream of `req.input_path` with late reverberation removed by WPE, as a WAV at
+    `req.output_path` with the stream's own sample rate and channels (32-bit float, sample-aligned with the input).
+    `skill` is the ffmpeg-skill handle (located from `req.ffmpeg_skill_dir` when None)."""
+    _check_dereverb(req)
+    src, dst = check_paths(req.input_path, req.output_path, req.overwrite)
+    engine, report = select_engine("dereverb", req.engine, req.offline)
+    skill, info = _usable_skill(skill, req.ffmpeg_skill_dir, float(req.timeout))
+    facts = skill.probe(src)
+    stream, stream_count = select_stream(facts, req.audio_stream, os.path.basename(src))
+    run_dir = _run_dir(dst, req.output_path)
+    try:
+        prepared = os.path.join(run_dir, PREPARED_NAME)
+        prepared_facts, step = extract_stream(skill, src, prepared, req.audio_stream)
+        pa = prepared_facts["audio"]
+        rate, channels = int(pa.get("sample_rate") or 0), int(pa.get("channels") or 0)
+        params: Dict[str, Any] = {"timeout": float(req.timeout)}
+        params.update({k: getattr(req, k) for k in ("taps", "delay", "iterations") if getattr(req, k) is not None})
+        stem = os.path.join(run_dir, "stem.wav")
+        result = run_engine(engine.id, EngineRequest(op="dereverb", input_path=prepared, output_path=stem, sample_rate=rate,
+                                                     params=params), float(req.timeout), run_dir)
+        out_facts = validate_output(skill, result.output_path, rate, float(prepared_facts.get("duration") or 0.0), engine.id,
+                                    channels=channels)
+        engine_doc = dict(report, version=result.engine_version, model=result.model, model_sha256=None)
+        x = result.extra
+        parameters = {"audio_stream": req.audio_stream, "taps": x.get("taps"), "delay": x.get("delay"),
+                      "iterations": x.get("iterations"), "method": x.get("method"), "statistics_mode": x.get("statistics_mode"),
+                      "stft": x.get("stft"), "block_seconds": x.get("block_seconds"), "sample_rate": rate, "channels": channels,
+                      "output_format": x.get("output_format")}
+        provenance = build_provenance(op="dereverb", engine=engine_doc, input_path=src, output_path=result.output_path,
+                                      parameters=parameters, ffmpeg_skill=info.to_dict())
+        _place(result.output_path, dst, req.overwrite)
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+    return {
+        "schema": DEREVERB_SCHEMA,
+        "ok": True,
+        "op": "dereverb",
+        "capability": "voice.dereverb",
+        "skill": {"id": SKILL_ID, "version": __version__},
+        "output": _output_doc(dst, out_facts),
+        "input": _input_doc(src, facts, req.audio_stream, stream_count, stream),
+        "engine": {k: engine_doc.get(k) for k in ("id", "version", "model")},
+        "parameters": parameters,
+        "steps": [step],
+        "provenance": provenance,
+        "warnings": [],
     }

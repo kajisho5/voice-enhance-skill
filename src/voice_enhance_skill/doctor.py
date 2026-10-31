@@ -17,8 +17,8 @@ from .errors import VoiceEnhanceError
 from .ffmpeg_skill import FfmpegSkill
 
 DOCTOR_SCHEMA = f"{SKILL_ID}/doctor@1"
-# op -> roadmap step that implements it; ISOLATE is implemented (step 3, ADR-003)
-IMPLEMENTED_OPS: Dict[str, bool] = {"isolate": True, "dereverb": False, "bleed_reduce": False}
+# op -> roadmap step that implements it; ISOLATE (step 3, ADR-003) and DEREVERB (step 4, ADR-004) are implemented
+IMPLEMENTED_OPS: Dict[str, bool] = {"isolate": True, "dereverb": True, "bleed_reduce": False}
 OP_STEP = {"isolate": 3, "dereverb": 4, "bleed_reduce": 5}
 
 

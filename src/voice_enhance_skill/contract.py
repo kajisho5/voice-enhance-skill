@@ -9,7 +9,7 @@ from .doctor import DOCTOR_SCHEMA, IMPLEMENTED_OPS, OP_STEP
 from .engines import DEFAULT_ENGINE, engine_ids, get_engine
 from .errors import ERROR_TABLE
 from .ffmpeg_skill import FLAGS_USED, OPTIONAL_FLAGS, SUPPORTED_CONTRACT_VERSION, TOOLS_USED
-from .ops import ISOLATE_RATE, ISOLATE_SCHEMA
+from .ops import DEREVERB_SCHEMA, ISOLATE_RATE, ISOLATE_SCHEMA
 
 CONTRACT_VERSION = "1.0"
 CAPABILITY_IDS = {"isolate": "voice.isolate", "dereverb": "voice.dereverb", "bleed_reduce": "voice.bleed_reduce"}
@@ -24,8 +24,15 @@ _OP_TOOLS = {
                 "result_keys": ["schema", "ok", "op", "capability", "skill", "output", "input", "engine", "parameters", "steps",
                                 "provenance", "warnings"]},
     "dereverb": {"description": "Speech with room reverberation reduced (WPE, nara_wpe)",
-                 "argv": ["dereverb", "<media>", "-o <out.wav>", "[--audio-stream 0]", "[--engine nara_wpe]",
-                          "[--timeout 3600]", "[--overwrite]", "--json"]},
+                 "argv": ["dereverb", "<media>", "-o <out.wav>", "[--audio-stream 0]", "[--engine nara_wpe]", "[--taps 10]",
+                          "[--delay 3]", "[--iterations 3]", "[--timeout 3600]", "[--overwrite]", "[--ffmpeg-skill <dir>]",
+                          "[--offline]", "--json"],
+                 "schema": DEREVERB_SCHEMA,
+                 "output": {"format": "wav", "codec": "pcm_f32le", "sample_rate": "same as the input stream",
+                            "channels": "same as the input stream (multi-channel WPE)",
+                            "alignment": "sample-aligned with the input (WPE subtracts a prediction; no delay is added)"},
+                 "result_keys": ["schema", "ok", "op", "capability", "skill", "output", "input", "engine", "parameters", "steps",
+                                 "provenance", "warnings"]},
     "bleed_reduce": {"description": "Per-microphone tracks with cross-talk from the other microphones reduced",
                      "argv": ["bleed-reduce", "<track.wav>...", "-o <out_dir>", "[--timeout 3600]", "[--overwrite]", "--json"]},
 }

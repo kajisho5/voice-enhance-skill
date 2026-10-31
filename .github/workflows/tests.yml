@@ -35,7 +35,8 @@ jobs:
   integration:
     # Real FFmpeg from apt, plus read-only checkouts of ffmpeg-skill main (the live contract and probe) and
     # AI-video-production-OS (registry conformance checks). No engine and no weights are installed (ADR-001), so
-    # nothing may skip here.
+    # nothing may skip here. NumPy is installed because the fake nara_wpe of the DEREVERB tests computes on it
+    # (ADR-004); nara_wpe itself is not.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -51,7 +52,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
-      - run: python -m pip install -e .
+      - run: python -m pip install -e . numpy
       - name: All tests run, none skipped
         env:
           VOICE_ENHANCE_FFMPEG_SKILL_DIR: ${{ github.workspace }}/vendor/ffmpeg-skill

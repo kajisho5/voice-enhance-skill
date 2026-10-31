@@ -1,36 +1,43 @@
 """Unit tests: contract, typed errors, engine registry and availability checks (with a fake deep-filter binary and
 mocked package lookups), the worker subprocess, the ISOLATE op (fake deep-filter, a stub ffmpeg-skill that reads and
-writes WAV with the stdlib), doctor, provenance and the OS registry conformance checks. No engine, no weights and no
-ffmpeg are needed; nothing is downloaded."""
+writes WAV with the stdlib), the DEREVERB op (a fake nara_wpe package on NumPy, the same stub ffmpeg-skill), doctor,
+provenance and the OS registry conformance checks. No engine, no weights and no ffmpeg are needed; nothing is
+downloaded. The DEREVERB engine tests need NumPy (the fake nara_wpe computes on it) and are skipped without it."""
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
+import struct
 import sys
 import tempfile
 import time
 import unittest
+import wave
 from pathlib import Path
 from unittest import mock
 
-from helpers import (OS_DIR, ROOT, env, fake_deep_filter, fake_model, read_wav, run_cli, snr_db, voice_noise_fixture, write_tone_wav,
-                     write_wav)
+from helpers import (OS_DIR, ROOT, env, fake_deep_filter, fake_model, fake_nara_wpe, fake_wpe_calls, have_numpy, on_python_path,
+                     read_wav, reverb_fixture, run_cli, snr_db, srr_db, voice_noise_fixture, write_tone_wav, write_wav)
 
 from voice_enhance_skill import SKILL_ID, __version__
 from voice_enhance_skill.contract import CAPABILITY_IDS, contract
 from voice_enhance_skill.doctor import doctor
 from voice_enhance_skill.engines import DEFAULT_ENGINE, engine_ids, engines_for, get_engine
 from voice_enhance_skill.engines import deepfilternet, nara_wpe_engine
-from voice_enhance_skill.engines.base import OPS, EngineRequest, EngineResult, parse_version
+from voice_enhance_skill.engines.base import OPS, Engine, EngineRequest, EngineResult, parse_version
 from voice_enhance_skill.errors import ERROR_TABLE, EXIT_CODES, VoiceEnhanceError
 from voice_enhance_skill.ffmpeg_skill import FLAGS_USED, OPTIONAL_FLAGS, TOOLS_USED, FfmpegSkill, parse_contract
-from voice_enhance_skill.ops import IsolateRequest, check_paths, isolate, select_engine, select_stream
+from voice_enhance_skill.ops import (DereverbRequest, IsolateRequest, check_paths, dereverb, isolate, select_engine,
+                                     select_stream)
 from voice_enhance_skill.procs import TIMEOUT_EXIT, run_process_group
 from voice_enhance_skill.provenance import build_provenance, sha256_file
 from voice_enhance_skill.service import run_engine
 
 POSIX = os.name == "posix"
+NUMPY = have_numpy()
+NEEDS_NUMPY = "needs numpy: the fake nara_wpe computes on it (the integration job installs it)"
 NO_DEEP_FILTER = {"VOICE_ENHANCE_DEEP_FILTER": os.path.join(tempfile.gettempdir(), "no-such-deep-filter"),
                   "VOICE_ENHANCE_DFN_MODEL": None}
 
@@ -101,8 +108,8 @@ class ContractTests(unittest.TestCase):
         for p in c["provides"]:
             self.assertEqual(set(p), {"id", "lifecycle", "tool_id"})
             self.assertIn(p["tool_id"], tool_ids)
-            # ISOLATE is implemented (step 3, ADR-003); the others are declared only (ADR-002)
-            self.assertEqual(p["lifecycle"], "EXPERIMENTAL" if p["id"] == "voice.isolate" else "PROPOSED", p)
+            # ISOLATE (step 3, ADR-003) and DEREVERB (step 4, ADR-004) are implemented; BLEED_REDUCE is declared only
+            self.assertEqual(p["lifecycle"], "EXPERIMENTAL" if p["id"] in ("voice.isolate", "voice.dereverb") else "PROPOSED", p)
         for d in c["dependencies"]:
             self.assertIsInstance(d["version_range"], str)
             self.assertFalse(d["version_range"].replace(".", "").isdigit(), d)
@@ -131,8 +138,17 @@ class ContractTests(unittest.TestCase):
         for flag in ("--audio-stream", "--atten-lim-db", "--timeout", "--overwrite", "--ffmpeg-skill", "--offline"):
             self.assertTrue(any(a.startswith("[" + flag) for a in tool["argv"]), flag)
         for t in contract()["tools"]:
-            if t["tool_id"] in (f"{SKILL_ID}/dereverb", f"{SKILL_ID}/bleed-reduce"):
+            if t["tool_id"] == f"{SKILL_ID}/bleed-reduce":
                 self.assertFalse(t["implemented"])
+
+    def test_dereverb_tool_entry(self):
+        tool = next(t for t in contract()["tools"] if t["tool_id"] == f"{SKILL_ID}/dereverb")
+        self.assertTrue(tool["implemented"])
+        self.assertEqual((tool["schema"], tool["engine"], tool["roadmap_step"], tool["output"]["codec"]),
+                         (f"{SKILL_ID}/dereverb@1", "nara_wpe", 4, "pcm_f32le"))
+        for flag in ("--audio-stream", "--engine", "--taps", "--delay", "--iterations", "--timeout", "--overwrite", "--ffmpeg-skill",
+                     "--offline"):
+            self.assertTrue(any(a.startswith("[" + flag) for a in tool["argv"]), flag)
 
     def test_version_comes_from_pyproject(self):
         want = re.search(r'^version = "([^"]+)"', (ROOT / "pyproject.toml").read_text(encoding="utf-8"), re.M).group(1)
@@ -280,12 +296,15 @@ class WorkerTests(unittest.TestCase):
                 run_engine("deepfilternet", EngineRequest("isolate", src, os.path.join(tmp, "b.wav")), 60, tmp)
         self.assertEqual((e.exception.code, e.exception.details["exit_code"]), ("ENGINE_FAILED", 9))   # mode "fail" exits 9
 
-    def test_dereverb_is_not_implemented_yet(self):
-        with mock.patch.object(nara_wpe_engine, "_found", return_value=True), \
-                mock.patch.object(nara_wpe_engine, "_dist_version", return_value="0.0.11"), \
-                self.assertRaises(VoiceEnhanceError) as e:
-            get_engine("nara_wpe").process(EngineRequest("dereverb", "a.wav", "b.wav"))
-        self.assertEqual((e.exception.code, e.exception.details["op"]), ("NOT_IMPLEMENTED", "dereverb"))   # roadmap step 4
+    def test_an_engine_without_process_is_not_implemented(self):
+        class Declared(Engine):          # an engine declared before its op exists (BLEED_REDUCE until step 5)
+            id, ops, roadmap_step = "declared", ("bleed_reduce",), 5
+
+            def inspect(self):
+                return {"status": "OK", "version": "1.0"}
+        with self.assertRaises(VoiceEnhanceError) as e:
+            Declared().process(EngineRequest("bleed_reduce", "a.wav", "b.wav"))
+        self.assertEqual((e.exception.code, e.exception.details["op"]), ("NOT_IMPLEMENTED", "bleed_reduce"))
 
     @unittest.skipUnless(POSIX, "process groups are POSIX here")
     def test_new_group_false_keeps_the_child_in_the_callers_group(self):
@@ -552,6 +571,248 @@ class IsolateCliErrorTests(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(tmp, "o.wav")))
 
 
+class NaraWpeParamTests(unittest.TestCase):
+    """What the nara_wpe engine accepts, checked without NumPy."""
+
+    def test_params(self):
+        self.assertEqual(nara_wpe_engine.check_params({}), {"taps": 10, "delay": 3, "iterations": 3})
+        self.assertEqual(nara_wpe_engine.check_params({"taps": 20, "delay": 2, "iterations": 1, "timeout": 5.0}),
+                         {"taps": 20, "delay": 2, "iterations": 1})
+        for bad in ({"taps": 0}, {"taps": 51}, {"delay": 0}, {"iterations": 21}, {"taps": 2.5}, {"taps": True}):
+            with self.assertRaises(VoiceEnhanceError) as e:
+                nara_wpe_engine.check_params(bad)
+            self.assertEqual(e.exception.code, "INVALID_ARGUMENT", bad)
+
+    def test_stft_sizes_follow_the_rate(self):
+        self.assertEqual(nara_wpe_engine.stft_sizes(16000), (512, 128))    # nara_wpe's own 16 kHz example
+        self.assertEqual(nara_wpe_engine.stft_sizes(48000), (1536, 384))
+        self.assertEqual(nara_wpe_engine.stft_sizes(44100), (1412, 353))
+
+
+@unittest.skipUnless(NUMPY, NEEDS_NUMPY)
+class NaraWpeProcessTests(unittest.TestCase):
+    """NaraWpeEngine.process through the real worker subprocess, with the fake nara_wpe package."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def run_wpe(self, src, mode="wpe", **params):
+        site = fake_nara_wpe(self.tmp, mode=mode)
+        with on_python_path(site):
+            res = run_engine("nara_wpe", EngineRequest("dereverb", src, os.path.join(self.tmp, "stem.wav"), sample_rate=16000,
+                                                       params=params), 60, self.tmp)
+        return res, fake_wpe_calls(site)
+
+    def test_dereverb_through_the_worker_raises_srr(self):
+        src = os.path.join(self.tmp, "input.wav")
+        dry = reverb_fixture(src, seconds=1.0, rate=16000)
+        res, calls = self.run_wpe(src, taps=10, delay=3, iterations=3)
+        self.assertEqual((res.engine_version, res.model), ("0.0.11", None))
+        self.assertEqual(res.extra["method"], "nara_wpe.wpe.wpe_v8")
+        self.assertEqual((res.extra["stft"], res.extra["output_format"]), ({"window": "hann", "size": 512, "hop": 128}, "pcm_f32le"))
+        self.assertEqual(len(calls), 1)                     # 1 s is one block
+        self.assertEqual((calls[0]["shape"][:2], calls[0]["taps"], calls[0]["delay"], calls[0]["iterations"], calls[0]["statistics_mode"]),
+                         ([257, 1], 10, 3, 3, "full"))
+        rate, ch, out = read_wav(res.output_path)
+        self.assertEqual((rate, ch, len(out)), (16000, 1, 16000))
+        self.assertEqual(Path(res.output_path).read_bytes()[20:22], b"\x03\x00")     # WAVE_FORMAT_IEEE_FLOAT
+        before, after = srr_db(dry, read_wav(src)[2]), srr_db(dry, out)
+        self.assertGreater(after, before + 6.0, (before, after))
+
+    def test_failure_in_nara_wpe_is_engine_failed(self):
+        src = write_tone_wav(os.path.join(self.tmp, "input.wav"), 0.2, rate=16000)
+        with self.assertRaises(VoiceEnhanceError) as e:
+            self.run_wpe(src, mode="fail")
+        self.assertEqual(e.exception.code, "ENGINE_FAILED")
+        self.assertIn("fake nara_wpe failed", e.exception.message)
+
+    def test_wrong_shape_from_nara_wpe_is_invalid_result(self):
+        src = write_tone_wav(os.path.join(self.tmp, "input.wav"), 0.2, rate=16000)
+        with self.assertRaises(VoiceEnhanceError) as e:
+            self.run_wpe(src, mode="badshape")
+        self.assertEqual(e.exception.code, "INVALID_RESULT")
+
+    def test_identity_round_trip_is_sample_aligned_across_blocks(self):
+        """With no filtering, STFT -> overlap-add gives the input back sample for sample, also across block borders
+        (0.25 s blocks here) and per channel: the engine adds no delay and loses no sample."""
+        import numpy as np
+        src = os.path.join(self.tmp, "stereo.wav")
+        left = [math.sin(2 * math.pi * 220 * i / 22050) * (i % 997) / 997 for i in range(int(0.9 * 22050))]
+        right = [((i * 7919) % 2000 - 1000) / 1500 for i in range(len(left))]
+        with wave.open(src, "wb") as w:
+            w.setnchannels(2), w.setsampwidth(2), w.setframerate(22050)
+            w.writeframes(b"".join(struct.pack("<hh", int(a * 32767), int(b * 32767)) for a, b in zip(left, right)))
+        out = os.path.join(self.tmp, "out.wav")
+        identity = lambda y, **kw: y.copy()  # noqa: E731
+        facts = nara_wpe_engine.dereverb_file(src, out, 10, 3, 3, np, identity, block_seconds=0.25)
+        self.assertEqual((facts["sample_rate"], facts["channels"], facts["frames"]), (22050, 2, len(left)))
+        a, b = nara_wpe_engine.WavReader(src), nara_wpe_engine.WavReader(out)
+        try:
+            x, y = a.read(np, 0, a.frames), b.read(np, 0, b.frames)
+        finally:
+            a.close(), b.close()
+        self.assertEqual(y.shape, x.shape)
+        self.assertLess(float(np.max(np.abs(y - x))), 1e-6)
+
+    def test_wav_reader_formats(self):
+        import numpy as np
+        vals = [0.0, 0.5, -0.25, -1.0]
+        plain = write_wav(os.path.join(self.tmp, "s16.wav"), vals, 8000)
+        ext24 = os.path.join(self.tmp, "s24.wav")       # WAVE_FORMAT_EXTENSIBLE, 24-bit, as ffmpeg writes it
+        data = b"".join(int(v * 8388607).to_bytes(3, "little", signed=True) for v in vals)
+        fmt = struct.pack("<HHIIHHHHIH14s", 0xFFFE, 1, 8000, 24000, 3, 24, 22, 24, 4, 1, b"\x00\x00\x00\x00\x10\x00\x80\x00\x00\xaa\x00\x38\x9b\x71")
+        Path(ext24).write_bytes(b"RIFF" + struct.pack("<I", 4 + 8 + len(fmt) + 8 + len(data)) + b"WAVE" + b"fmt " + struct.pack("<I", len(fmt))
+                                + fmt + b"data" + struct.pack("<I", len(data)) + data)
+        for path in (plain, ext24):
+            r = nara_wpe_engine.WavReader(path)
+            try:
+                got = r.read(np, -1, 6)[:, 0]
+            finally:
+                r.close()
+            self.assertEqual(len(got), 6)
+            self.assertEqual((got[0], got[-1]), (0.0, 0.0))           # outside the file: zeros
+            for g, v in zip(got[1:5], vals):
+                self.assertAlmostEqual(float(g), v, delta=1e-4)
+        bad = os.path.join(self.tmp, "bad.wav")
+        Path(bad).write_bytes(b"not a wav file at all")
+        with self.assertRaises(VoiceEnhanceError):
+            nara_wpe_engine.WavReader(bad)
+
+
+class DereverbPlanningTests(unittest.TestCase):
+    """The checks DEREVERB makes before any media work (no NumPy, no engine)."""
+
+    def test_numbers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = write_tone_wav(os.path.join(tmp, "in.wav"), 0.1)
+            for kw in ({"timeout": 0}, {"audio_stream": -1}, {"taps": 0}, {"taps": 51}, {"delay": 0}, {"iterations": 21},
+                       {"taps": True}):
+                with self.assertRaises(VoiceEnhanceError) as e:
+                    dereverb(DereverbRequest(src, os.path.join(tmp, "o.wav"), **kw), skill=StubSkill())
+                self.assertEqual(e.exception.code, "INVALID_ARGUMENT", kw)
+
+    def test_missing_engine_is_refused_before_any_media_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = write_tone_wav(os.path.join(tmp, "in.wav"), 0.1)
+            skill = StubSkill()
+            with mock.patch.object(nara_wpe_engine, "_found", return_value=False), self.assertRaises(VoiceEnhanceError) as e:
+                dereverb(DereverbRequest(src, os.path.join(tmp, "o.wav")), skill=skill)
+            self.assertEqual((e.exception.code, e.exception.details["engine"]), ("ENGINE_UNAVAILABLE", "nara_wpe"))
+            self.assertIn("[wpe]", e.exception.details["install"])
+            self.assertEqual(skill.calls, [])
+            with mock.patch.object(nara_wpe_engine, "_found", return_value=False):
+                rc, doc = run_cli("dereverb", src, "-o", os.path.join(tmp, "o.wav"), "--json")
+            self.assertEqual((rc, doc["ok"], doc["error"]["code"]), (3, False, "ENGINE_UNAVAILABLE"))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "o.wav")))
+        with self.assertRaises(VoiceEnhanceError) as e:
+            select_engine("dereverb", "deepfilternet")
+        self.assertEqual(e.exception.code, "INVALID_ARGUMENT")
+
+
+@unittest.skipUnless(NUMPY, NEEDS_NUMPY)
+class DereverbOpTests(unittest.TestCase):
+    """DEREVERB end to end with the fake nara_wpe and the stub ffmpeg-skill."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+        self.skill = StubSkill()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def run_dereverb(self, src, out, mode="wpe", **kw):
+        self.site = fake_nara_wpe(os.path.join(self.tmp, "engine"), mode=mode)
+        with on_python_path(self.site):
+            return dereverb(DereverbRequest(src, out, **kw), skill=self.skill)
+
+    def assert_no_leftovers(self):
+        self.assertEqual([n for n in os.listdir(self.tmp) if n.startswith(".voice-enhance-")], [])
+
+    def test_reverberant_fixture_srr_rises(self):
+        src, out = os.path.join(self.tmp, "room.wav"), os.path.join(self.tmp, "dry.wav")
+        dry = reverb_fixture(src, seconds=1.0, rate=16000)
+        src_sha = sha256_file(src)
+        doc = self.run_dereverb(src, out, taps=12)
+        self.assertEqual(sha256_file(src), src_sha)                       # the input is never modified
+        rate, ch, x = read_wav(out)
+        self.assertEqual((rate, ch, len(x)), (16000, 1, 16000))          # the input's own rate: nothing was resampled
+        before, after = srr_db(dry, read_wav(src)[2]), srr_db(dry, x)
+        self.assertGreater(after, before + 6.0, (before, after))
+        self.assertEqual((doc["schema"], doc["ok"], doc["op"], doc["capability"]), (f"{SKILL_ID}/dereverb@1", True, "dereverb", "voice.dereverb"))
+        self.assertEqual((doc["output"]["path"], doc["output"]["sample_rate"], doc["output"]["channels"]), (out, 16000, 1))
+        self.assertEqual(doc["engine"], {"id": "nara_wpe", "version": "0.0.11", "model": None})
+        p = doc["parameters"]
+        self.assertEqual((p["taps"], p["delay"], p["iterations"], p["statistics_mode"], p["output_format"]), (12, 3, 3, "full", "pcm_f32le"))
+        self.assertEqual(p["stft"], {"window": "hann", "size": 512, "hop": 128})
+        self.assertEqual([c["taps"] for c in fake_wpe_calls(self.site)], [12])
+        self.assertEqual(doc["steps"], [{"tool": "ffmpeg-skill/audio", "flags": ["--audio-stream", "0"],
+                                         "result": {"sample_rate": 16000, "channels": 1}}])
+        self.assertEqual(self.skill.calls, [{"src": "room.wav", "audio_stream": 0, "mono": False, "sample_rate": None}])
+        prov = doc["provenance"]
+        self.assertEqual((prov["op"], prov["input"]["sha256"], prov["output"]["sha256"]), ("dereverb", src_sha, sha256_file(out)))
+        self.assertEqual((prov["engine"]["id"], prov["engine"]["weights_license"], prov["ffmpeg_skill"]["version"]),
+                         ("nara_wpe", "none (signal processing, no weights)", "2.22.4"))
+        self.assertEqual(doc["warnings"], [])
+        json.dumps(doc, allow_nan=False)
+        self.assert_no_leftovers()
+
+    def test_stereo_44k1_keeps_rate_and_channels(self):
+        """WPE takes any rate and channel count: a 44.1 kHz stereo stream needs no audio --sample-rate (the stub has
+        none) and no fold-down; all channels go to one multi-channel WPE call."""
+        src, out = os.path.join(self.tmp, "stereo.wav"), os.path.join(self.tmp, "dry.wav")
+        dry = reverb_fixture(src, seconds=0.5, rate=44100, channels=2)
+        doc = self.run_dereverb(src, out)
+        rate, ch, x = read_wav(out)
+        self.assertEqual((rate, ch, doc["output"]["channels"], doc["parameters"]["sample_rate"]), (44100, 2, 2, 44100))
+        self.assertEqual(fake_wpe_calls(self.site)[0]["shape"][:2], [707, 2])        # 1412-point STFT, 2 channels
+        self.assertEqual(len(self.skill.calls), 1)
+        self.assertGreater(srr_db(dry, x), srr_db(dry, read_wav(src)[2]) + 6.0)
+
+    def test_engine_failure_writes_nothing(self):
+        src, out = os.path.join(self.tmp, "room.wav"), os.path.join(self.tmp, "dry.wav")
+        reverb_fixture(src, seconds=0.3, rate=16000)
+        for mode, code in (("badshape", "INVALID_RESULT"), ("fail", "ENGINE_FAILED")):
+            with self.assertRaises(VoiceEnhanceError) as e:
+                self.run_dereverb(src, out, mode=mode)
+            self.assertEqual(e.exception.code, code)
+            self.assertFalse(os.path.exists(out))
+            self.assert_no_leftovers()
+
+    def test_output_failing_validation_writes_nothing(self):
+        src, out = os.path.join(self.tmp, "room.wav"), os.path.join(self.tmp, "dry.wav")
+        reverb_fixture(src, seconds=0.3, rate=16000)
+        real_probe = self.skill.probe
+        def probe(path):                     # ffmpeg-skill reads the stem as mono when it should be stereo
+            facts = real_probe(path)
+            if os.path.basename(path) == "stem.wav":
+                facts["audio"] = dict(facts["audio"], channels=2)
+            return facts
+        self.skill.probe = probe
+        with self.assertRaises(VoiceEnhanceError) as e:
+            self.run_dereverb(src, out)
+        self.assertEqual(e.exception.code, "INVALID_RESULT")
+        self.assertIn("2 channels, expected 1", e.exception.message)
+        self.assertFalse(os.path.exists(out))
+        self.assert_no_leftovers()
+
+    def test_cli_dereverb_json(self):
+        src, out = os.path.join(self.tmp, "room.wav"), os.path.join(self.tmp, "dry.wav")
+        reverb_fixture(src, seconds=0.3, rate=16000)
+        site = fake_nara_wpe(os.path.join(self.tmp, "engine"))
+        with on_python_path(site), mock.patch("voice_enhance_skill.ops.FfmpegSkill.locate", return_value=self.skill):
+            rc, doc = run_cli("dereverb", src, "-o", out, "--taps", "8", "--json")
+            rc2, err = run_cli("dereverb", src, "-o", out, "--json")
+            rc3, again = run_cli("dereverb", src, "-o", out, "--overwrite", "--iterations", "1", "--json")
+        self.assertEqual((rc, doc["ok"], doc["output"]["path"], doc["parameters"]["taps"]), (0, True, out, 8))
+        self.assertEqual((rc2, err["ok"], err["error"]["code"]), (EXIT_CODES["OUTPUT_EXISTS"], False, "OUTPUT_EXISTS"))
+        self.assertEqual((rc3, again["parameters"]["iterations"]), (0, 1))
+
+
 class FfmpegSkillContractTests(unittest.TestCase):
     def doc(self, drop=None):
         return fake_ffmpeg_contract(drop)
@@ -595,7 +856,7 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(set(d["checks"]["operations"]), set(OPS))
         self.assertFalse(any(o["ready"] for o in d["checks"]["operations"].values()))
         self.assertEqual({op: o["implemented"] for op, o in d["checks"]["operations"].items()},
-                         {"isolate": True, "dereverb": False, "bleed_reduce": False})
+                         {"isolate": True, "dereverb": True, "bleed_reduce": False})
         self.assertEqual((rc, cli_doc["status"], cli_doc["offline"]), (1, "fail", True))
 
     def test_engines_command(self):

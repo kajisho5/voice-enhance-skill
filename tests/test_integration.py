@@ -1,6 +1,6 @@
 """Integration with a real ffmpeg-skill checkout and a real FFmpeg: locate it, check every tool and flag this skill
-emits against its live contract, run its doctor, probe a WAV through it, and run ISOLATE end to end on a video with
-two audio streams (fake deep-filter; the real engine only when it is installed). Skipped without a checkout
+emits against its live contract, run its doctor, probe a WAV through it, and run ISOLATE and DEREVERB end to end on a
+video with two audio streams (fake deep-filter, fake nara_wpe on NumPy; the real engines only when installed). Skipped without a checkout
 (VOICE_ENHANCE_FFMPEG_SKILL_DIR or ../ffmpeg-skill); CI's integration job always has one. FFmpeg is called directly
 here only to build the fixtures; the skill itself never does."""
 from __future__ import annotations
@@ -11,14 +11,14 @@ import subprocess
 import tempfile
 import unittest
 
-from helpers import (FFMPEG_SKILL_DIR, env, fake_deep_filter, fake_model, read_wav, run_cli, snr_db, voice_noise_fixture,
-                     write_tone_wav)
+from helpers import (FFMPEG_SKILL_DIR, env, fake_deep_filter, fake_model, fake_nara_wpe, fake_wpe_calls, have_numpy, on_python_path,
+                     read_wav, reverb_fixture, run_cli, snr_db, srr_db, voice_noise_fixture, write_tone_wav)
 
 from voice_enhance_skill.doctor import doctor
 from voice_enhance_skill.engines import get_engine
 from voice_enhance_skill.errors import VoiceEnhanceError
 from voice_enhance_skill.ffmpeg_skill import TOOLS_USED, FfmpegSkill
-from voice_enhance_skill.ops import IsolateRequest, isolate
+from voice_enhance_skill.ops import DereverbRequest, IsolateRequest, dereverb, isolate
 
 HAVE_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 NO_DEEP_FILTER = {"VOICE_ENHANCE_DEEP_FILTER": os.path.join(tempfile.gettempdir(), "no-such-deep-filter")}
@@ -27,6 +27,10 @@ POSIX = os.name == "posix"
 
 def real_engine_ok() -> bool:
     return get_engine("deepfilternet").inspect()["status"] == "OK"
+
+
+def real_wpe_ok() -> bool:
+    return get_engine("nara_wpe").inspect()["status"] == "OK"
 
 
 def two_stream_video(directory: str, voice_wav: str) -> str:
@@ -150,6 +154,58 @@ class IsolateIntegrationTests(unittest.TestCase):
         doc = isolate(IsolateRequest(src, out), skill=self.skill)
         self.assertEqual(doc["engine"]["model"], "DeepFilterNet3_onnx.tar.gz")
         self.assertGreater(snr_db(clean, read_wav(out)[2]), snr_db(clean, read_wav(src)[2]))
+
+
+@unittest.skipUnless(FFMPEG_SKILL_DIR and HAVE_FFMPEG, "needs an ffmpeg-skill checkout and ffmpeg/ffprobe on PATH")
+class DereverbIntegrationTests(unittest.TestCase):
+    """DEREVERB through the real ffmpeg-skill (probe, audio) and the real worker."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+        self.skill = FfmpegSkill.locate(str(FFMPEG_SKILL_DIR))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    @unittest.skipUnless(have_numpy(), "needs numpy: the fake nara_wpe computes on it")
+    def test_second_stream_of_a_video_srr_rises(self):
+        room = os.path.join(self.tmp, "room.wav")
+        dry = reverb_fixture(room, seconds=1.0, rate=48000, channels=2)
+        video = two_stream_video(self.tmp, room)
+        out = os.path.join(self.tmp, "dry.wav")
+        site = fake_nara_wpe(os.path.join(self.tmp, "engine"))
+        with on_python_path(site):
+            doc = dereverb(DereverbRequest(video, out, audio_stream=1), skill=self.skill)
+        rate, ch, x = read_wav(out)
+        self.assertEqual((rate, ch), (48000, 2))            # the stream's own layout: no fold-down for WPE (ADR-004)
+        self.assertEqual((doc["output"]["codec"], doc["output"]["channels"]), ("pcm_f32le", 2))
+        self.assertEqual((doc["input"]["has_video"], doc["input"]["audio_stream_count"]), (True, 2))
+        self.assertEqual([st["flags"] for st in doc["steps"]], [["--audio-stream", "1"]])
+        self.assertEqual(fake_wpe_calls(site)[0]["shape"][:2], [769, 2])
+        before, after = srr_db(dry, read_wav(room)[2]), srr_db(dry, x)
+        self.assertGreater(after, before + 6.0, (before, after))     # and the decoy (stream 0) was not the one processed
+        self.assertAlmostEqual(doc["output"]["duration"], 1.0, delta=0.05)
+        self.assertEqual(doc["provenance"]["ffmpeg_skill"]["version"], self.skill.info().version)
+
+    @unittest.skipUnless(have_numpy(), "needs numpy: the fake nara_wpe computes on it")
+    def test_other_sample_rate_needs_no_conversion(self):
+        src = os.path.join(self.tmp, "cd.wav")
+        reverb_fixture(src, seconds=0.5, rate=44100)
+        out = os.path.join(self.tmp, "dry.wav")
+        with on_python_path(fake_nara_wpe(os.path.join(self.tmp, "engine"))):
+            rc, doc = run_cli("dereverb", src, "-o", out, "--ffmpeg-skill", str(FFMPEG_SKILL_DIR), "--json")
+        self.assertEqual((rc, doc["ok"], doc["output"]["sample_rate"], doc["output"]["channels"]), (0, True, 44100, 1), doc)
+        self.assertAlmostEqual(doc["output"]["duration"], 0.5, delta=0.02)
+
+    @unittest.skipUnless(real_wpe_ok(), "nara_wpe is not installed (CI installs no engine, ADR-001)")
+    def test_real_nara_wpe_raises_srr(self):
+        src = os.path.join(self.tmp, "room.wav")
+        dry = reverb_fixture(src, seconds=2.0, rate=16000)
+        out = os.path.join(self.tmp, "dry.wav")
+        doc = dereverb(DereverbRequest(src, out), skill=self.skill)
+        self.assertEqual(doc["engine"]["id"], "nara_wpe")
+        self.assertGreater(srr_db(dry, read_wav(out)[2]), srr_db(dry, read_wav(src)[2]))
 
 
 if __name__ == "__main__":

@@ -12,7 +12,8 @@ Which ffmpeg-skill tools are used, and for what (ADR-003):
   probe   input facts before an op (duration, audio streams), output validation after it
   audio   `-o <x.wav> --audio-stream N`: the chosen audio stream as PCM WAV (the picture is dropped); a second pass
           `--mono` on that one-stream WAV when it has more than one channel; `--sample-rate` only when this
-          checkout declares it (OPTIONAL_FLAGS, capability-detected). Step 6 adds `--replace` (the cleaned stem back
+          checkout declares it (OPTIONAL_FLAGS, capability-detected). DEREVERB uses the first pass only: WPE takes any
+          rate and channel count (ADR-004). Step 6 adds `--replace` (the cleaned stem back
           into the video, video stream copied) with `--overwrite` only when the caller asked for it
 `join` is not used: it refuses a single clip, so it cannot convert one file (ADR-003).
 """
