@@ -65,3 +65,66 @@ jobs:
         run: |
           voice-enhance doctor --json --ffmpeg-skill vendor/ffmpeg-skill | tee doctor.json
           python -c "import json; d=json.load(open('doctor.json')); assert d['status']=='degraded' and d['checks']['ffmpeg_skill']['status']=='OK', d['problems']"
+
+  engines:
+    # Linux only, the real engines (ADR-007): deep-filter 0.5.6, the static musl binary of the DeepFilterNet release,
+    # with DeepFilterNet3_onnx.tar.gz from models/ at the same tag (it is not a release asset), both checked against a
+    # pinned SHA-256; nara_wpe 0.0.11 from PyPI through `.[wpe]`. No PyTorch anywhere. The real-engine tests that skip
+    # in every other job must run and pass here: the only skip allowed is the unit test that needs nara_wpe absent.
+    runs-on: ubuntu-24.04
+    env:
+      DFN_VERSION: "0.5.6"
+      DFN_BINARY_SHA256: 70775e251eee44c0f2451a1e833326cf8bcbbe304d3e7cd12851e6fce72ef7da
+      DFN_MODEL_SHA256: c94d91f70911001c946e0fabb4aa9adc37045f45a03b56008cb0c8244cb63616
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: kajisho5/ffmpeg-skill
+          path: vendor/ffmpeg-skill
+      - uses: actions/checkout@v4
+        with:
+          repository: kajisho5/AI-video-production-OS
+          path: vendor/AI-video-production-OS
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Install deep-filter and the DeepFilterNet3 model (pinned SHA-256)
+        run: |
+          set -eu
+          dfn="$RUNNER_TEMP/dfn"
+          mkdir -p "$dfn/bin"
+          curl -fsSL --retry 3 -o "$dfn/bin/deep-filter" \
+            "https://github.com/Rikorose/DeepFilterNet/releases/download/v$DFN_VERSION/deep-filter-$DFN_VERSION-x86_64-unknown-linux-musl"
+          curl -fsSL --retry 3 -o "$dfn/DeepFilterNet3_onnx.tar.gz" \
+            "https://raw.githubusercontent.com/Rikorose/DeepFilterNet/v$DFN_VERSION/models/DeepFilterNet3_onnx.tar.gz"
+          echo "$DFN_BINARY_SHA256  $dfn/bin/deep-filter" | sha256sum -c -
+          echo "$DFN_MODEL_SHA256  $dfn/DeepFilterNet3_onnx.tar.gz" | sha256sum -c -
+          chmod +x "$dfn/bin/deep-filter"
+          echo "$dfn/bin" >> "$GITHUB_PATH"
+          echo "VOICE_ENHANCE_DFN_MODEL=$dfn/DeepFilterNet3_onnx.tar.gz" >> "$GITHUB_ENV"
+      - name: The real deep-filter CLI (the flags ADR-003 builds on)
+        run: |
+          deep-filter --version
+          deep-filter --help
+      - run: python -m pip install -e '.[wpe,bleed]' && python -m pip list
+      - name: doctor reports every engine OK
+        run: |
+          voice-enhance doctor --json --ffmpeg-skill vendor/ffmpeg-skill | tee doctor.json
+          python -c "import json; d=json.load(open('doctor.json')); e=d['checks']['engines']; assert all(v['status']=='OK' for v in e.values()), e; assert d['status']=='ok', d['problems']"
+      - name: All tests run, the real-engine ones included
+        env:
+          VOICE_ENHANCE_FFMPEG_SKILL_DIR: ${{ github.workspace }}/vendor/ffmpeg-skill
+          AI_VIDEO_PRODUCTION_OS_DIR: ${{ github.workspace }}/vendor/AI-video-production-OS
+        run: |
+          set -o pipefail
+          python -m unittest discover -s tests -v 2>&1 | tee test.log
+          ! grep -E "\.\.\. skipped" test.log | grep -v "skipped 'nara_wpe is installed'"
+          for t in test_real_deep_filter_cli_flags test_real_deep_filter_raises_snr test_real_deep_filter_is_sample_aligned test_real_nara_wpe_raises_srr; do
+            grep -E "^$t .*\.\.\. ok$" test.log || { echo "::error::$t did not run and pass"; exit 1; }
+          done
+      - name: Measure the real engines on the synthetic fixtures (job summary)
+        env:
+          VOICE_ENHANCE_FFMPEG_SKILL_DIR: ${{ github.workspace }}/vendor/ffmpeg-skill
+        run: python tests/measure_engines.py | tee -a "$GITHUB_STEP_SUMMARY"

@@ -208,6 +208,15 @@ def snr_db(clean: List[float], test: List[float]) -> float:
     return 10 * math.log10(signal / max(error, 1e-20))
 
 
+def best_lag(reference: List[float], test: List[float], start: int, length: int, max_lag: int) -> int:
+    """The lag in samples (positive: `test` is late) at which `test` best matches `reference`, by the
+    cross-correlation of reference[start:start + length] with test shifted by -max_lag..max_lag. Pure Python."""
+    ref = reference[start:start + length]
+    def corr(lag: int) -> float:
+        return sum(r * test[start + lag + i] for i, r in enumerate(ref))
+    return max(range(-max_lag, max_lag + 1), key=corr)
+
+
 def write_tone_wav(path: str, seconds: float = 1.0, rate: int = 48000, freq: float = 440.0) -> str:
     n = int(seconds * rate)
     with wave.open(path, "wb") as w:
