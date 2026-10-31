@@ -17,7 +17,7 @@
 
 AI voice isolation, dereverberation and mic-bleed reduction for recorded speech, for the [AI Video Production OS](https://github.com/kajisho5/AI-video-production-OS) (department 音 / Audio). Local and offline: engines are optional, never downloaded by the skill, and every media step (probe, format conversion, putting the cleaned audio back into the video) goes through [ffmpeg-skill](https://github.com/kajisho5/ffmpeg-skill).
 
-**Status: 0.1.0, unreleased.** `isolate` ([ADR-003](docs/decisions.md)), `dereverb` ([ADR-004](docs/decisions.md)) and `bleed-reduce` ([ADR-005](docs/decisions.md)) work (`EXPERIMENTAL`). `contract`, `doctor` and `engines` work. Next on the [roadmap](ECOSYSTEM_ROADMAP.md): step 6, putting the cleaned audio back into the video.
+**Status: 0.1.0, unreleased.** `isolate` ([ADR-003](docs/decisions.md)), `dereverb` ([ADR-004](docs/decisions.md)) and `bleed-reduce` ([ADR-005](docs/decisions.md)) work (`EXPERIMENTAL`). `remux` puts a cleaned stem back into its video ([ADR-006](docs/decisions.md)). `contract`, `doctor` and `engines` work. Next on the [roadmap](ECOSYSTEM_ROADMAP.md): step 7, SKILL.md and the CI matrix.
 
 | Op | Capability | Engine ([ADR-001](docs/decisions.md)) | Licence (code / weights) | Step |
 |---|---|---|---|---|
@@ -38,6 +38,8 @@ voice-enhance dereverb talk.mp4 -o talk_dry.wav --json          # reverb removed
 voice-enhance dereverb hall.wav -o hall_dry.wav --taps 15 --iterations 5 --json
 voice-enhance bleed-reduce panel.mkv -o clean/ --json          # every audio stream is one mic; one float WAV per mic
 voice-enhance bleed-reduce lav_a.wav lav_b.wav -o clean/ --dominance-db 6 --json
+voice-enhance remux talk.mp4 talk_voice.wav -o talk_clean.mp4 --json   # the stem back under the picture, video stream copied
+voice-enhance remux panel.mkv clean/panel_a0.wav -o panel_a0.mkv --drop-other-audio --json
 ```
 
 ## isolate
@@ -58,6 +60,12 @@ The `crosstalk` engine is signal processing on NumPy, with no model and no weigh
 
 Each track is written to `<out_dir>/<input name>_a<stream>.wav` as mono 32-bit float, with its own length and sample-aligned with its input. Every stem is checked through ffmpeg-skill/probe before any is placed. A new output directory appears whole or not at all. In an existing one no file is replaced without `--overwrite`. The op does not align tracks: separately recorded tracks have to be lined up first (ffmpeg-skill `sync`), and a length difference gives a warning. Two microphones on the two channels of one stream cannot be separated, because ffmpeg-skill has no channel-select flag yet, so such a stream is folded down to one track (with a warning). `--timeout` works as for `isolate`.
 
+## remux
+
+`remux` puts a stem (from `isolate`, `dereverb` or `bleed-reduce`, or any audio file) back into its video with one ffmpeg-skill `audio --replace` call. The video stream is copied packet for packet, not re-encoded. The stem becomes the output's only audio stream, encoded by the container (AAC for `.mp4`, `.mov` and `.mkv`), and is padded with silence or trimmed to the video's length. The output keeps the input's container (same extension). A container change is ffmpeg-skill `export`'s job.
+
+`--replace` keeps only the first video stream and none of the input's audio streams, so `remux` refuses, before anything is written, a file with more than one video stream (`FFMPEG_SKILL_UNAVAILABLE`). A file with more than one audio stream is refused too, unless `--drop-other-audio` accepts an output whose only audio is the stem. The output is checked through ffmpeg-skill/probe: one video and one audio stream, and the video's codec, profile, size, pixel format, frame rate, frame count and length unchanged. Only then is it renamed into place. A stem whose length differs from the video's, or an input whose audio starts away from its video, gives a warning. The inputs are never modified, and `--overwrite` and `--timeout` (here the ffmpeg-skill time limit) work as for `isolate`. No engine is involved.
+
 ## Engines (optional)
 
 - **DeepFilterNet3** (ISOLATE): download `deep-filter` for your platform and `DeepFilterNet3_onnx.tar.gz` from the [DeepFilterNet releases](https://github.com/Rikorose/DeepFilterNet/releases) (v0.5.x). Put `deep-filter` on `PATH` (or set `VOICE_ENHANCE_DEEP_FILTER`) and set `VOICE_ENHANCE_DFN_MODEL` to the model tarball.
@@ -68,7 +76,7 @@ Each track is written to `<out_dir>/<input name>_a<stream>.wav` as mono 32-bit f
 
 ## ffmpeg-skill
 
-Located from `--ffmpeg-skill`, `VOICE_ENHANCE_FFMPEG_SKILL_DIR`, `VIDEO_AGENT_FFMPEG_SKILL_DIR`, `~/.claude/skills/ffmpeg-skill`, `./vendor/ffmpeg-skill` or `../ffmpeg-skill`. Compatibility is checked tool by tool and flag by flag against its contract (`probe`, `audio --audio-stream --mono --replace --overwrite`, plus the optional `audio --sample-rate`), not by version number.
+Located from `--ffmpeg-skill`, `VOICE_ENHANCE_FFMPEG_SKILL_DIR`, `VIDEO_AGENT_FFMPEG_SKILL_DIR`, `~/.claude/skills/ffmpeg-skill`, `./vendor/ffmpeg-skill` or `../ffmpeg-skill`. Compatibility is checked tool by tool and flag by flag against its contract (`probe`, `audio --audio-stream --mono --replace`, plus the optional `audio --sample-rate`), not by version number.
 
 ## JSON and errors
 
@@ -80,7 +88,7 @@ With `--json`, stdout holds exactly one JSON document. Failures are `{"ok": fals
 python -m unittest discover -s tests -v
 ```
 
-Unit tests need no engine, no weights and no FFmpeg (fake `deep-filter`, a fake `nara_wpe` package, mocked package lookups, a stdlib stub of ffmpeg-skill for every op). The ISOLATE SNR check runs on a synthetic voice+noise fixture. The DEREVERB check (signal-to-reverberation ratio) runs on a synthetic reverberant fixture and needs NumPy, because the fake nara_wpe computes on it. The BLEED_REDUCE check (cross-talk energy) runs on a synthetic two-microphone fixture and needs NumPy, because the crosstalk engine computes on it. Both are skipped without NumPy. The real-engine versions run only where the engine is installed. The integration tests run against a real ffmpeg-skill checkout (`VOICE_ENHANCE_FFMPEG_SKILL_DIR` or `../ffmpeg-skill`) and FFmpeg; the OS registry conformance checks run when `AI_VIDEO_PRODUCTION_OS_DIR` (or `../AI-video-production-OS`) is present.
+Unit tests need no engine, no weights and no FFmpeg (fake `deep-filter`, a fake `nara_wpe` package, mocked package lookups, a stdlib stub of ffmpeg-skill for every op). The ISOLATE SNR check runs on a synthetic voice+noise fixture. The DEREVERB check (signal-to-reverberation ratio) runs on a synthetic reverberant fixture and needs NumPy, because the fake nara_wpe computes on it. The BLEED_REDUCE check (cross-talk energy) runs on a synthetic two-microphone fixture and needs NumPy, because the crosstalk engine computes on it. Both are skipped without NumPy. The REMUX checks use a stub whose videos carry a picture payload, and the integration tests check that the video packets are byte-identical through the real ffmpeg-skill. The real-engine versions run only where the engine is installed. The integration tests run against a real ffmpeg-skill checkout (`VOICE_ENHANCE_FFMPEG_SKILL_DIR` or `../ffmpeg-skill`) and FFmpeg; the OS registry conformance checks run when `AI_VIDEO_PRODUCTION_OS_DIR` (or `../AI-video-production-OS`) is present.
 
 ## Licence
 

@@ -1,9 +1,10 @@
 """Integration with a real ffmpeg-skill checkout and a real FFmpeg: locate it, check every tool and flag this skill
 emits against its live contract, run its doctor, probe a WAV through it, and run ISOLATE, DEREVERB and BLEED_REDUCE end
 to end on a video with two audio streams (fake deep-filter, fake nara_wpe on NumPy, the crosstalk engine on NumPy; the
-real ISOLATE / DEREVERB engines only when installed). Skipped without a checkout
-(VOICE_ENHANCE_FFMPEG_SKILL_DIR or ../ffmpeg-skill); CI's integration job always has one. FFmpeg is called directly
-here only to build the fixtures; the skill itself never does."""
+real ISOLATE / DEREVERB engines only when installed), and REMUX a stem back into a video (Matroska / FFV1 and MP4 /
+MPEG-4 Part 2). Skipped without a checkout (VOICE_ENHANCE_FFMPEG_SKILL_DIR or ../ffmpeg-skill); CI's integration job
+always has one. FFmpeg is called directly here only to build the fixtures, and ffprobe only to hash the video packets
+REMUX must leave byte-identical; the skill itself never calls either."""
 from __future__ import annotations
 
 import os
@@ -20,7 +21,8 @@ from voice_enhance_skill.doctor import doctor
 from voice_enhance_skill.engines import get_engine
 from voice_enhance_skill.errors import VoiceEnhanceError
 from voice_enhance_skill.ffmpeg_skill import TOOLS_USED, FfmpegSkill
-from voice_enhance_skill.ops import BleedReduceRequest, DereverbRequest, IsolateRequest, bleed_reduce, dereverb, isolate
+from voice_enhance_skill.ops import (BleedReduceRequest, DereverbRequest, IsolateRequest, RemuxRequest, bleed_reduce, dereverb, isolate,
+                                     remux)
 
 HAVE_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 NO_DEEP_FILTER = {"VOICE_ENHANCE_DEEP_FILTER": os.path.join(tempfile.gettempdir(), "no-such-deep-filter")}
@@ -281,6 +283,79 @@ class BleedReduceIntegrationTests(unittest.TestCase):
                 bleed_reduce(BleedReduceRequest([a, b], self.out), skill=self.skill)
             self.assertEqual((e.exception.code, e.exception.details["sample_rates"]), ("FFMPEG_SKILL_UNAVAILABLE", [48000, 44100]))
             self.assertFalse(os.path.exists(self.out))
+
+
+def video_packets(path: str) -> list:
+    """(pts, MD5 of the data) of every packet of the first video stream: equal lists mean the picture is byte-identical."""
+    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts,data_hash",
+                          "-show_data_hash", "MD5", "-of", "csv=p=0", path], check=True, capture_output=True, text=True,
+                         stdin=subprocess.DEVNULL).stdout
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def stream_types(path: str) -> list:
+    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", path], check=True,
+                         capture_output=True, text=True, stdin=subprocess.DEVNULL).stdout
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+@unittest.skipUnless(FFMPEG_SKILL_DIR and HAVE_FFMPEG, "needs an ffmpeg-skill checkout and ffmpeg/ffprobe on PATH")
+class RemuxIntegrationTests(unittest.TestCase):
+    """REMUX through the real ffmpeg-skill (probe, audio --replace): roadmap step 6 is done when the video stream is
+    byte-identical."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+        self.skill = FfmpegSkill.locate(str(FFMPEG_SKILL_DIR))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def assert_no_leftovers(self):
+        self.assertEqual([n for n in os.listdir(self.tmp) if n.startswith(".voice-enhance-")], [])
+
+    @unittest.skipUnless(POSIX, "the fake deep-filter is a shell script")
+    def test_isolate_stem_back_into_a_two_stream_video(self):
+        voice = os.path.join(self.tmp, "voice_noise.wav")
+        voice_noise_fixture(voice, seconds=1.0, channels=2)
+        video = two_stream_video(self.tmp, voice)
+        stem, out = os.path.join(self.tmp, "voice.wav"), os.path.join(self.tmp, "talk_clean.mkv")
+        engine_dir = os.path.join(self.tmp, "engine")
+        os.mkdir(engine_dir)
+        with env(VOICE_ENHANCE_DEEP_FILTER=fake_deep_filter(engine_dir, mode="lowpass"), VOICE_ENHANCE_DFN_MODEL=fake_model(engine_dir)):
+            isolate(IsolateRequest(video, stem, audio_stream=1), skill=self.skill)
+        # two audio streams: ffmpeg-skill/audio --replace cannot keep the other one, so it is refused unless dropped
+        with self.assertRaises(VoiceEnhanceError) as e:
+            remux(RemuxRequest(video, stem, out), skill=self.skill)
+        self.assertEqual((e.exception.code, e.exception.details["audio_stream_count"]), ("FFMPEG_SKILL_UNAVAILABLE", 2))
+        self.assertFalse(os.path.exists(out))
+        doc = remux(RemuxRequest(video, stem, out, drop_other_audio=True), skill=self.skill)
+        self.assertEqual(video_packets(out), video_packets(video))                 # the picture is byte-identical
+        self.assertEqual(sorted(stream_types(out)), ["audio", "video"])
+        self.assertEqual((doc["output"]["video"]["codec"], doc["output"]["video"]["stream_copied"]), ("ffv1", True))
+        self.assertEqual((doc["output"]["audio"]["codec"], doc["output"]["audio"]["channels"]), ("aac", 1))
+        self.assertIn("--drop-other-audio", doc["warnings"][0])
+        self.assertEqual(doc["provenance"]["ffmpeg_skill"]["version"], self.skill.info().version)
+        self.assert_no_leftovers()
+
+    def test_cli_mp4_video_byte_identical(self):
+        video = os.path.join(self.tmp, "clip.mp4")
+        subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "testsrc=s=96x64:r=25:d=2", "-f", "lavfi",
+                        "-i", "sine=f=300:d=2:r=48000", "-c:v", "mpeg4", "-g", "12", "-c:a", "aac", "-shortest", video],
+                       check=True, stdin=subprocess.DEVNULL)
+        stem = write_tone_wav(os.path.join(self.tmp, "stem.wav"), seconds=1.5, rate=48000, freq=500.0)
+        out = os.path.join(self.tmp, "clip_clean.mp4")
+        rc, doc = run_cli("remux", video, stem, "-o", out, "--ffmpeg-skill", str(FFMPEG_SKILL_DIR), "--json")
+        self.assertEqual((rc, doc["ok"]), (0, True), doc)
+        self.assertEqual(video_packets(out), video_packets(video))
+        self.assertEqual(sorted(stream_types(out)), ["audio", "video"])
+        self.assertEqual(doc["output"]["video"]["nb_frames"], doc["input"]["video"]["nb_frames"])
+        self.assertAlmostEqual(doc["output"]["audio"]["duration"], 2.0, delta=0.05)    # the 1.5 s stem padded to the video
+        self.assertIn("pads it with silence", doc["warnings"][0])
+        rc2, err = run_cli("remux", video, stem, "-o", out, "--ffmpeg-skill", str(FFMPEG_SKILL_DIR), "--json")
+        self.assertEqual((rc2, err["error"]["code"]), (2, "OUTPUT_EXISTS"))
+        self.assert_no_leftovers()
 
 
 if __name__ == "__main__":

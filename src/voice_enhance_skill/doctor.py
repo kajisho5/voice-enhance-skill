@@ -20,6 +20,8 @@ DOCTOR_SCHEMA = f"{SKILL_ID}/doctor@1"
 # op -> roadmap step that implements it: ISOLATE (step 3, ADR-003), DEREVERB (step 4, ADR-004), BLEED_REDUCE (step 5, ADR-005)
 IMPLEMENTED_OPS: Dict[str, bool] = {"isolate": True, "dereverb": True, "bleed_reduce": True}
 OP_STEP = {"isolate": 3, "dereverb": 4, "bleed_reduce": 5}
+# helpers that run no engine: REMUX (step 6, ADR-006) needs only ffmpeg-skill
+HELPERS = {"remux": {"implemented": True, "roadmap_step": 6, "ffmpeg_skill_tool": "audio --replace"}}
 
 
 def engines_report(offline: bool = False) -> Dict[str, Any]:
@@ -69,6 +71,7 @@ def doctor(ffmpeg_skill_dir: Optional[str] = None, offline: bool = False) -> Dic
         ops[op] = {"implemented": IMPLEMENTED_OPS[op], "roadmap_step": OP_STEP[op], "engine": eid, "engine_status": engine_status,
                    "ready": bool(IMPLEMENTED_OPS[op] and media_ok and engine_status == OK)}
     checks["operations"] = ops
+    checks["helpers"] = {name: dict(h, ready=bool(h["implemented"] and media_ok)) for name, h in HELPERS.items()}
     missing_engines = sorted(eid for eid, e in engines.items() if e["status"] != OK)
     status = "fail" if problems else ("degraded" if missing_engines else "ok")
     return {

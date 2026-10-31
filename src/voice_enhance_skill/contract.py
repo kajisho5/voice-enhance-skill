@@ -10,7 +10,7 @@ from .engines import DEFAULT_ENGINE, engine_ids, get_engine
 from .errors import ERROR_TABLE
 from .ffmpeg_skill import FLAGS_USED, OPTIONAL_FLAGS, SUPPORTED_CONTRACT_VERSION, TOOLS_USED
 from .engines.crosstalk import DEFAULTS as CROSSTALK_DEFAULTS, MAX_TRACKS, MIN_TRACKS
-from .ops import BLEED_REDUCE_SCHEMA, DEREVERB_SCHEMA, ISOLATE_RATE, ISOLATE_SCHEMA
+from .ops import BLEED_REDUCE_SCHEMA, DEREVERB_SCHEMA, ISOLATE_RATE, ISOLATE_SCHEMA, REMUX_SCHEMA, REMUX_STEP, REMUX_VIDEO_KEYS
 
 CONTRACT_VERSION = "1.0"
 CAPABILITY_IDS = {"isolate": "voice.isolate", "dereverb": "voice.dereverb", "bleed_reduce": "voice.bleed_reduce"}
@@ -57,6 +57,22 @@ def tools() -> list:
         out.append({"tool_id": f"{SKILL_ID}/{op.replace('_', '-')}", "role": "transformation", "writes_media": True,
                     "mutates_input": False, "deterministic": True, "implemented": IMPLEMENTED_OPS[op], "roadmap_step": OP_STEP[op],
                     "engine": DEFAULT_ENGINE[op], **spec})
+    # A helper, not a capability: muxing belongs to ffmpeg-skill, and this tool only calls its audio --replace (ADR-006)
+    out.append({"tool_id": f"{SKILL_ID}/remux", "role": "assembly", "writes_media": True, "mutates_input": False, "deterministic": True,
+                "implemented": True, "roadmap_step": REMUX_STEP, "engine": None,
+                "description": "Put a cleaned stem back into its video: the video stream copied packet for packet, the stem as the only "
+                               "audio stream (ffmpeg-skill/audio --replace)",
+                "argv": ["remux", "<video>", "<stem>", "-o <out.same-container>", "[--drop-other-audio]", "[--timeout 3600]",
+                         "[--overwrite]", "[--ffmpeg-skill <dir>]", "[--offline]", "--json"],
+                "schema": REMUX_SCHEMA, "ffmpeg_skill_tool": "audio --replace",
+                "input": {"video": "a file with exactly one video stream; more than one audio stream only with --drop-other-audio",
+                          "stem": "any audio file ffmpeg-skill reads (its first audio stream is used)"},
+                "output": {"container": "the input's (same extension)", "video": "stream copy: packets unchanged",
+                           "audio": "the stem as the only audio stream, encoded by the container (AAC for .mp4 / .mov / .mkv), "
+                                    "padded with silence or trimmed to the input's duration",
+                           "checked": list(REMUX_VIDEO_KEYS) + ["nb_frames", "duration", "stream_counts"]},
+                "result_keys": ["schema", "ok", "op", "skill", "output", "input", "stem", "parameters", "steps", "provenance",
+                                "warnings"]})
     out += [
         {"tool_id": f"{SKILL_ID}/doctor", "role": "diagnostic", "writes_media": False, "mutates_input": False, "deterministic": False,
          "implemented": True, "description": "What is installed and missing (engines, ffmpeg-skill) and how to get it; never downloads",
@@ -108,7 +124,7 @@ def contract() -> Dict[str, Any]:
                     "statuses": ["OK", "MISSING", "INCOMPATIBLE"]},
         "provenance": {"fields": ["skill", "op", "engine.id", "engine.version", "engine.model", "engine.model_sha256", "engine.code_license",
                                   "engine.weights_license", "engine.attribution", "input.sha256", "output.sha256",
-                                  "inputs[].sha256 (bleed_reduce)", "outputs[].sha256 (bleed_reduce)", "parameters",
+                                  "inputs[].sha256 (bleed_reduce, remux)", "outputs[].sha256 (bleed_reduce, remux)", "parameters",
                                   "ffmpeg_skill.version", "network"],
                        "status": "OBSERVED"},
         "execution": {"canonical_invocation": ["voice-enhance", "<command>", "...", "--json"], "network": False, "shell": False,
