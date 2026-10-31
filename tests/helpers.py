@@ -167,6 +167,18 @@ def voice_noise_fixture(path: str, seconds: float = 1.5, rate: int = 48000, snr_
 def read_wav(path: str) -> Tuple[int, int, List[float]]:
     """(sample rate, channels, mono samples in [-1, 1]) for PCM 16/24/32-bit and IEEE float WAV (the real deep-filter's
     output format is not pinned down here, and the stdlib wave module reads integer PCM only)."""
+    rate, ch, vals = _wav_interleaved(path)
+    frames = len(vals) // ch
+    return rate, ch, [sum(vals[f * ch:(f + 1) * ch]) / ch for f in range(frames)]
+
+
+def read_float_wav_channels(path: str) -> Tuple[int, List[List[float]]]:
+    """(sample rate, one list per channel) for any WAV read_wav reads, float included."""
+    rate, ch, vals = _wav_interleaved(path)
+    return rate, [vals[k::ch] for k in range(ch)]
+
+
+def _wav_interleaved(path: str) -> Tuple[int, int, List[float]]:
     data = Path(path).read_bytes()
     if data[:4] != b"RIFF" or data[8:12] != b"WAVE":
         raise ValueError(f"{path} is not a RIFF/WAVE file")
@@ -196,8 +208,7 @@ def read_wav(path: str) -> Tuple[int, int, List[float]]:
         vals = [int.from_bytes(payload[i:i + 3], "little", signed=True) / 8388608.0 for i in range(0, count * 3, 3)]
     else:
         raise ValueError(f"{path}: unsupported WAV format {tag}/{bits} bit")
-    frames = len(vals) // ch
-    return rate, ch, [sum(vals[f * ch:(f + 1) * ch]) / ch for f in range(frames)]
+    return rate, ch, vals
 
 
 def snr_db(clean: List[float], test: List[float]) -> float:
@@ -336,21 +347,31 @@ def syllables(seconds: float, rate: int, seed: int = 5, breath: float = 0.3) -> 
 
 
 REVERB_COMBS = ((0.037, 0.6), (0.059, 0.5))     # (delay in s, feedback gain): two feedback comb filters in series
+REVERB_COMBS_B = ((0.043, 0.55), (0.067, 0.45))  # the second microphone's room in a distinct multi-channel fixture
 
 
-def reverb_fixture(path: str, seconds: float = 1.0, rate: int = 16000, channels: int = 1) -> List[float]:
+def reverb_fixture(path: str, seconds: float = 1.0, rate: int = 16000, channels: int = 1, distinct: bool = False) -> List[float]:
     """The synthetic reverberant fixture: syllables() through two feedback comb filters in series (37 ms / 0.6 and
     59 ms / 0.5, a decaying echo tail whose inverse is a short prediction filter, the model WPE assumes). Writes the
     reverberant signal and returns the dry signal at the same scale, so srr_db(dry, read_wav(x)) is the
-    signal-to-reverberation ratio of any processed version of it. O(n) pure Python."""
+    signal-to-reverberation ratio of any processed version of it. O(n) pure Python. With several channels the same
+    signal goes to every channel (dual mono), unless `distinct`: then every other channel hears its own room
+    (REVERB_COMBS_B), as a second microphone would, and the channels are linearly independent."""
     dry = syllables(seconds, rate)
-    wet = list(dry)
-    for delay, gain in REVERB_COMBS:
-        d = int(delay * rate)
-        for i in range(d, len(wet)):
-            wet[i] += gain * wet[i - d]
-    scale = 0.5 / max(abs(v) for v in wet)
-    write_wav(path, [v * scale for v in wet], rate, channels)
+    rooms = [REVERB_COMBS_B if distinct and k % 2 else REVERB_COMBS for k in range(channels if distinct else 1)]
+    tracks = []
+    for combs in rooms:
+        wet = list(dry)
+        for delay, gain in combs:
+            d = int(delay * rate)
+            for i in range(d, len(wet)):
+                wet[i] += gain * wet[i - d]
+        tracks.append(wet)
+    scale = 0.5 / max(abs(v) for wet in tracks for v in wet)
+    if distinct:
+        write_wav_tracks(path, [[v * scale for v in wet] for wet in tracks], rate)
+    else:
+        write_wav(path, [v * scale for v in tracks[0]], rate, channels)
     return [v * scale for v in dry]
 
 

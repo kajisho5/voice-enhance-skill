@@ -121,7 +121,8 @@ jobs:
           set -o pipefail
           python -m unittest discover -s tests -v 2>&1 | tee test.log
           ! grep -E "\.\.\. skipped" test.log | grep -v "skipped 'nara_wpe is installed'"
-          for t in test_real_deep_filter_cli_flags test_real_deep_filter_raises_snr test_real_deep_filter_is_sample_aligned test_real_nara_wpe_raises_srr; do
+          for t in test_real_deep_filter_cli_flags test_real_deep_filter_raises_snr test_real_deep_filter_is_sample_aligned \
+                   test_real_nara_wpe_raises_srr test_real_nara_wpe_dual_mono test_real_nara_wpe_distinct_stereo; do
             grep -E "^$t .*\.\.\. ok$" test.log || { echo "::error::$t did not run and pass"; exit 1; }
           done
       - name: Measure the real engines on the synthetic fixtures (job summary)

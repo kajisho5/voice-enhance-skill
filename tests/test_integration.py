@@ -14,9 +14,9 @@ import subprocess
 import tempfile
 import unittest
 
-from helpers import (FFMPEG_SKILL_DIR, best_lag, crosstalk_fixture, energy_db, env, fake_deep_filter, fake_model, fake_nara_wpe, fake_wpe_calls,
-                     have_numpy, on_python_path, read_wav, reverb_fixture, run_cli, snr_db, srr_db, voice_noise_fixture, write_tone_wav,
-                     write_wav)
+from helpers import (FFMPEG_SKILL_DIR, best_lag, crosstalk_fixture, energy_db, env, fake_deep_filter, fake_model, fake_nara_wpe,
+                     fake_wpe_calls, have_numpy, on_python_path, read_float_wav_channels, read_wav, read_wav_channels, reverb_fixture,
+                     run_cli, snr_db, srr_db, voice_noise_fixture, write_tone_wav, write_wav)
 
 from voice_enhance_skill.doctor import doctor
 from voice_enhance_skill.engines import get_engine
@@ -209,7 +209,7 @@ class DereverbIntegrationTests(unittest.TestCase):
     @unittest.skipUnless(have_numpy(), "needs numpy: the fake nara_wpe computes on it")
     def test_second_stream_of_a_video_srr_rises(self):
         room = os.path.join(self.tmp, "room.wav")
-        dry = reverb_fixture(room, seconds=1.0, rate=48000, channels=2)
+        dry = reverb_fixture(room, seconds=1.0, rate=48000, channels=2, distinct=True)
         video = two_stream_video(self.tmp, room)
         out = os.path.join(self.tmp, "dry.wav")
         site = fake_nara_wpe(os.path.join(self.tmp, "engine"))
@@ -221,8 +221,10 @@ class DereverbIntegrationTests(unittest.TestCase):
         self.assertEqual((doc["input"]["has_video"], doc["input"]["audio_stream_count"]), (True, 2))
         self.assertEqual([st["flags"] for st in doc["steps"]], [["--audio-stream", "1"]])
         self.assertEqual(fake_wpe_calls(site)[0]["shape"][:2], [769, 2])
-        before, after = srr_db(dry, read_wav(room)[2]), srr_db(dry, x)
-        self.assertGreater(after, before + 6.0, (before, after))     # and the decoy (stream 0) was not the one processed
+        self.assertEqual((doc["parameters"]["independent_channels"], doc["warnings"]), (2, []))
+        for k, (wet, out_ch) in enumerate(zip(read_wav_channels(room)[1], read_float_wav_channels(out)[1])):
+            before, after = srr_db(dry, wet), srr_db(dry, out_ch)
+            self.assertGreater(after, before + 6.0, (k, before, after))     # and the decoy (stream 0) was not the one processed
         self.assertAlmostEqual(doc["output"]["duration"], 1.0, delta=0.05)
         self.assertEqual(doc["provenance"]["ffmpeg_skill"]["version"], self.skill.info().version)
 
@@ -245,6 +247,31 @@ class DereverbIntegrationTests(unittest.TestCase):
         self.assertEqual(doc["engine"]["id"], "nara_wpe")
         before, after = srr_db(dry, read_wav(src)[2]), srr_db(dry, read_wav(out)[2])
         self.assertGreater(after, before + REAL_DEREVERB_MIN_GAIN_DB, (before, after))
+
+    @unittest.skipUnless(real_wpe_ok(), "nara_wpe is not installed (only CI's engines job installs it, ADR-007)")
+    def test_real_nara_wpe_dual_mono(self):
+        # ADR-007: on two identical channels the real wpe_v8 diverged (SRR -0.8 -> -48 dB in CI) before the engine
+        # learnt to run WPE on the independent components only.
+        src = os.path.join(self.tmp, "dual.wav")
+        dry = reverb_fixture(src, seconds=2.0, rate=48000, channels=2)
+        out = os.path.join(self.tmp, "dry.wav")
+        doc = dereverb(DereverbRequest(src, out), skill=self.skill)
+        self.assertEqual((doc["parameters"]["independent_channels"], len(doc["warnings"])), (1, 1))
+        _, (left, right) = read_float_wav_channels(out)
+        self.assertLess(max(abs(a - b) for a, b in zip(left, right)), 1e-6)
+        before, after = srr_db(dry, read_wav(src)[2]), srr_db(dry, left)
+        self.assertGreater(after, before + REAL_DEREVERB_MIN_GAIN_DB, (before, after))
+
+    @unittest.skipUnless(real_wpe_ok(), "nara_wpe is not installed (only CI's engines job installs it, ADR-007)")
+    def test_real_nara_wpe_distinct_stereo(self):
+        src = os.path.join(self.tmp, "pair.wav")
+        dry = reverb_fixture(src, seconds=2.0, rate=48000, channels=2, distinct=True)
+        out = os.path.join(self.tmp, "dry.wav")
+        doc = dereverb(DereverbRequest(src, out), skill=self.skill)
+        self.assertEqual((doc["parameters"]["independent_channels"], doc["warnings"]), (2, []))
+        for k, (wet, out_ch) in enumerate(zip(read_wav_channels(src)[1], read_float_wav_channels(out)[1])):
+            before, after = srr_db(dry, wet), srr_db(dry, out_ch)
+            self.assertGreater(after, before + REAL_DEREVERB_MIN_GAIN_DB, (k, before, after))
 
 
 def mic_video(directory: str, wavs: list) -> str:

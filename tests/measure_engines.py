@@ -14,7 +14,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np  # noqa: E402
-from helpers import FFMPEG_SKILL_DIR, read_wav, reverb_fixture, snr_db, srr_db, voice_noise_fixture  # noqa: E402
+from helpers import (FFMPEG_SKILL_DIR, read_float_wav_channels, read_wav, read_wav_channels, reverb_fixture, snr_db, srr_db,  # noqa: E402
+                     voice_noise_fixture, write_wav_tracks)
 
 from voice_enhance_skill.engines.deepfilternet import ENV_MODEL, find_binary  # noqa: E402
 from voice_enhance_skill.ffmpeg_skill import FfmpegSkill  # noqa: E402
@@ -58,18 +59,35 @@ def main() -> int:
         else:
             facts = f"exit {res.returncode}: {(res.stderr or res.stdout).strip()[-200:]}"
         rows.append(("deep-filter (direct)", "voice+white noise 0 dB, 2 s, 16 kHz mono", "-", facts, "-", "-"))
-        for rate, channels in ((16000, 1), (48000, 1), (48000, 2)):
-            src = os.path.join(tmp, f"room_{rate}_{channels}.wav")
-            dry = reverb_fixture(src, seconds=2.0, rate=rate, channels=channels)
-            out = os.path.join(tmp, f"dry_{rate}_{channels}.wav")
+        cases = (("1 ch", 16000, 1, None), ("1 ch", 48000, 1, None), ("2 ch dual mono", 48000, 2, None),
+                 ("2 ch, R = L + noise at -40 dB", 48000, 2, -40.0), ("2 ch, a room per channel", 48000, 2, "distinct"))
+        for label, rate, channels, variant in cases:
+            src = os.path.join(tmp, f"room_{rate}_{channels}_{variant}.wav")
+            dry = reverb_fixture(src, seconds=2.0, rate=rate, channels=channels, distinct=variant == "distinct")
+            if isinstance(variant, float):
+                _, (left, _) = read_wav_channels(src)
+                rng = np.random.default_rng(1)
+                right = np.asarray(left) + rng.standard_normal(len(left)) * np.std(left) * 10 ** (variant / 20)
+                write_wav_tracks(src, [left, list(right)], rate)
+            out = os.path.join(tmp, f"dry_{rate}_{channels}_{variant}.wav")
             t0 = time.monotonic()
             doc = dereverb(DereverbRequest(src, out), skill=skill)
             secs = time.monotonic() - t0
-            r, ch, x = read_wav(out)
-            rows.append(("dereverb", f"speech-like + two combs, 2 s, {rate // 1000} kHz, {channels} ch",
-                         f"SRR {srr_db(dry, read_wav(src)[2]):.1f} -> {srr_db(dry, x):.1f} dB",
-                         f"{r} Hz / {ch} ch, {len(dry) - len(x)} samples shorter, lag {lag(dry, x, 40)}",
-                         f"{secs:.2f} s", doc["engine"]["version"]))
+            wet, cleaned = read_wav_channels(src)[1], read_float_wav_channels(out)[1]
+            srr = ", ".join(f"{srr_db(dry, a):.1f} -> {srr_db(dry, b):.1f}" for a, b in zip(wet, cleaned))
+            rows.append(("dereverb", f"speech-like + two combs, 2 s, {rate // 1000} kHz, {label}", f"SRR per channel {srr} dB",
+                         f"{len(cleaned)} ch, {len(dry) - len(cleaned[0])} samples shorter, lag {lag(dry, cleaned[0], 40)}, "
+                         f"independent channels {doc['parameters']['independent_channels']}", f"{secs:.2f} s", doc["engine"]["version"]))
+        # The cause ADR-007 works around: wpe_v8 itself on two identical channels (no regularisation in nara_wpe).
+        from nara_wpe.wpe import wpe_v8
+        rng = np.random.default_rng(2)
+        a = rng.standard_normal((4, 1, 3000)) + 1j * rng.standard_normal((4, 1, 3000))
+        for label, y in (("one channel", a), ("two identical channels", np.concatenate([a, a], axis=1))):
+            with np.errstate(all="ignore"):
+                z = wpe_v8(y, taps=10, delay=3, iterations=3, statistics_mode="full")
+            ratio = float(np.nanmax(np.abs(z)) / np.max(np.abs(y))) if np.isfinite(z).any() else float("nan")
+            rows.append(("nara_wpe.wpe_v8 (direct)", f"white complex STFT, 4 bins x 3000 frames, {label}", "-",
+                         f"finite {bool(np.isfinite(z).all())}, output/input peak {ratio:.3g}", "-", "-"))
     print("| Op | Fixture | Measure | Output | Wall time | Engine |")
     print("|---|---|---|---|---|---|")
     for row in rows:
