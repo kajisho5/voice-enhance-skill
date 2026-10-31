@@ -37,12 +37,21 @@ jobs:
     # Velisa, the OS (registry conformance checks). No engine and no weights are installed (ADR-001), so
     # nothing may skip here. NumPy is installed because the fake nara_wpe of the DEREVERB tests computes on it
     # (ADR-004), and so does the crosstalk engine of BLEED_REDUCE (ADR-005); nara_wpe itself is not.
+    # Run against ffmpeg-skill main and against the 3.0.0 release pinned by commit (ADR-008).
+    name: integration (ffmpeg-skill ${{ matrix.ffmpeg_skill.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        ffmpeg_skill:
+          - {name: main, ref: main}
+          - {name: "3.0.0", ref: 1dc2f52013956daa1d97fd9d9d53c79b9305bc43}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
           repository: kajisho5/ffmpeg-skill
+          ref: ${{ matrix.ffmpeg_skill.ref }}
           path: vendor/ffmpeg-skill
       - uses: actions/checkout@v4
         with:

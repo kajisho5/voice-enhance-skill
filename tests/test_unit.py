@@ -1544,7 +1544,8 @@ class FfmpegSkillContractTests(unittest.TestCase):
         self.assertEqual(info.to_dict()["optional_flags"], {"audio": {"sample_rate": False}})
         with_rate = parse_contract(fake_ffmpeg_contract(extra=[("audio", "sample_rate")]), Path("."))
         self.assertTrue(with_rate.supported and with_rate.takes_flag("audio", "sample_rate"))
-        self.assertTrue(parse_contract(dict(self.doc(), contract_version="2.0"), Path(".")).warnings)
+        self.assertFalse(parse_contract(dict(self.doc(), contract_version="2.0"), Path(".")).warnings)   # ffmpeg-skill 3.x (ADR-008)
+        self.assertTrue(parse_contract(dict(self.doc(), contract_version="3.0"), Path(".")).warnings)
 
     def test_locate_explicit_dir_is_never_replaced(self):
         with self.assertRaises(VoiceEnhanceError) as e:
