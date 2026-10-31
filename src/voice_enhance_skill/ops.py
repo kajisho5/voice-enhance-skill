@@ -372,7 +372,7 @@ def dereverb(req: DereverbRequest, skill: Optional[FfmpegSkill] = None) -> Dict[
         parameters = {"audio_stream": req.audio_stream, "taps": x.get("taps"), "delay": x.get("delay"),
                       "iterations": x.get("iterations"), "method": x.get("method"), "statistics_mode": x.get("statistics_mode"),
                       "stft": x.get("stft"), "block_seconds": x.get("block_seconds"), "sample_rate": rate, "channels": channels,
-                      "output_format": x.get("output_format")}
+                      "output_format": x.get("output_format"), "independent_channels": x.get("independent_channels")}
         provenance = build_provenance(op="dereverb", engine=engine_doc, input_path=src, output_path=result.output_path,
                                       parameters=parameters, ffmpeg_skill=info.to_dict())
         _place(result.output_path, dst, req.overwrite)
@@ -390,8 +390,18 @@ def dereverb(req: DereverbRequest, skill: Optional[FfmpegSkill] = None) -> Dict[
         "parameters": parameters,
         "steps": [step],
         "provenance": provenance,
-        "warnings": [],
+        "warnings": _dereverb_warnings(channels, parameters.get("independent_channels")),
     }
+
+
+def _dereverb_warnings(channels: int, independent: Any) -> List[str]:
+    """ADR-007: channels that are linear copies of each other are dereverberated as their independent components."""
+    if not isinstance(independent, int) or independent >= channels:
+        return []
+    if independent == 0:
+        return ["the audio stream is silent: there was nothing to dereverberate, and the output is silent too"]
+    return [f"the {channels} channels of the stream carry only {independent} independent signal(s) somewhere (dual mono or a "
+            f"panned mono source): WPE ran on {independent} component(s) there, so the channels did not help predict each other"]
 
 
 def _check_bleed(req: BleedReduceRequest) -> None:

@@ -7,7 +7,9 @@ process(), step by step (ADR-004):
   stft      Hann window of 32 ms, hop of 8 ms (window = 4 hops) at the file's own rate, padded so every sample is
             covered by all four overlapping frames
   wpe       nara_wpe.wpe.wpe_v8 per block of BLOCK_SECONDS, multi-channel (all channels of the stream predict each
-            other), with the taps + delay - 1 frames before the block as context
+            other), with the taps + delay - 1 frames before the block as context. Channels that are linear copies of
+            each other (dual mono, a panned mono source) are first reduced to their independent components, because
+            wpe_v8 has no regularisation and diverges on a singular correlation matrix (ADR-007)
   istft     weighted overlap-add; with no filtering the input comes back sample for sample (no delay)
   write     32-bit float WAV, same rate, same channels, same length as the input (nothing is clipped or requantised)
 The WAV reader and writer, the STFT and the overlap-add live in wavio, shared with the crosstalk engine (ADR-005)."""
@@ -27,6 +29,9 @@ LIMITS = {"taps": (1, 50), "delay": (1, 20), "iterations": (1, 20)}
 HOP_SECONDS = 0.008                  # STFT hop; the window is 4 hops (32 ms), as in nara_wpe's 16 kHz examples (512 / 128)
 BLOCK_SECONDS = 30.0                 # WPE statistics per block, so memory does not grow with the file's length
 WPE_FUNCTION = "nara_wpe.wpe.wpe_v8"
+# A channel direction whose energy is this far below the strongest one is treated as absent (-60 dB): WPE runs on the
+# independent components only, and what lies outside them passes through unchanged (ADR-007).
+RANK_TOLERANCE = 1e-6
 OUTPUT_FORMAT = "pcm_f32le"
 
 
@@ -53,6 +58,22 @@ def stft_sizes(rate: int) -> Tuple[int, int]:
     return wavio.stft_sizes(rate, HOP_SECONDS)
 
 
+def independent_basis(np: Any, y: Any, tolerance: float = RANK_TOLERANCE) -> Any:
+    """Orthonormal (D, r) basis of the channel directions that carry energy in the (F, D, T) STFT `y`, or None when all
+    D are independent (nothing to reduce). r is 0 for a silent block. From the eigenvectors of the broadband channel
+    covariance sum_f,t y y^H whose eigenvalue is above `tolerance` times the largest."""
+    d = y.shape[1]
+    if d < 2:
+        return None
+    cov = np.einsum("fdt,fet->de", y, y.conj())
+    values, vectors = np.linalg.eigh((cov + cov.conj().T) / 2)
+    top = float(values[-1].real)
+    if top <= 0.0:
+        return vectors[:, :0]
+    keep = values.real > tolerance * top
+    return None if bool(keep.all()) else vectors[:, keep]
+
+
 def dereverb_file(src: str, dst: str, taps: int, delay: int, iterations: int, np: Any, wpe: Any,
                   block_seconds: float = BLOCK_SECONDS) -> Dict[str, Any]:
     """WPE on the WAV at `src`, written to `dst` as 32-bit float with the same rate, channels and length. `np` is
@@ -64,13 +85,29 @@ def dereverb_file(src: str, dst: str, taps: int, delay: int, iterations: int, np
         size, hop = stft_sizes(rate)
         block = max(1, int(round(block_seconds * rate / hop)))
 
-        def process(spec: Any, skip: int) -> Any:
-            y = np.ascontiguousarray(spec.transpose(1, 2, 0))                             # (F, D, T)
+        ranks = []
+
+        def run_wpe(y: Any) -> Any:
             z = wpe(y, taps=taps, delay=delay, iterations=iterations, statistics_mode="full")
             if getattr(z, "shape", None) != y.shape:
                 raise VoiceEnhanceError("INVALID_RESULT", f"{WPE_FUNCTION} returned shape {getattr(z, 'shape', None)}, "
                                         f"expected {y.shape}", {"engine": "nara_wpe"})
-            return np.asarray(z).transpose(2, 0, 1)[skip:]
+            return np.asarray(z)
+
+        def process(spec: Any, skip: int) -> Any:
+            y = np.ascontiguousarray(spec.transpose(1, 2, 0))                             # (F, D, T)
+            basis = independent_basis(np, y)
+            if basis is None:
+                ranks.append(y.shape[1])
+                z = run_wpe(y)
+            else:
+                # x = y + U (wpe(U^H y) - U^H y): WPE on the r independent components, the rest of y untouched
+                ranks.append(basis.shape[1])
+                z = y
+                if basis.shape[1]:
+                    c = np.ascontiguousarray(np.einsum("dr,fdt->frt", basis.conj(), y))
+                    z = y + np.einsum("dr,frt->fdt", basis, run_wpe(c) - c)
+            return z.transpose(2, 0, 1)[skip:]
 
         writer = FloatWavWriter(dst, rate, channels)
         try:
@@ -80,7 +117,7 @@ def dereverb_file(src: str, dst: str, taps: int, delay: int, iterations: int, np
         if writer.frames != n:
             raise VoiceEnhanceError("INVALID_RESULT", f"wrote {writer.frames} frames, expected {n}", {"engine": "nara_wpe"})
         return {"sample_rate": rate, "channels": channels, "frames": n, "stft": {"window": "hann", "size": size, "hop": hop},
-                "block_seconds": float(block_seconds)}
+                "block_seconds": float(block_seconds), "independent_channels": min(ranks) if ranks else channels}
     finally:
         reader.close()
 
@@ -136,4 +173,5 @@ class NaraWpeEngine(Engine):
         facts = dereverb_file(req.input_path, req.output_path, params["taps"], params["delay"], params["iterations"], np, wpe_v8)
         return EngineResult(output_path=req.output_path, engine_version=str(info["version"]), model=None,
                             extra=dict(params, method=WPE_FUNCTION, statistics_mode="full", stft=facts["stft"],
-                                       block_seconds=facts["block_seconds"], output_format=OUTPUT_FORMAT))
+                                       block_seconds=facts["block_seconds"], output_format=OUTPUT_FORMAT,
+                                       independent_channels=facts["independent_channels"]))

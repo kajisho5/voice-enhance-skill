@@ -22,7 +22,7 @@ from pathlib import Path
 from unittest import mock
 
 from helpers import (OS_DIR, ROOT, crosstalk_fixture, energy_db, env, fake_deep_filter, fake_model, fake_nara_wpe, fake_wpe_calls,
-                     have_numpy, on_python_path, read_wav, read_wav_channels, reverb_fixture, run_cli, snr_db, srr_db,
+                     have_numpy, on_python_path, read_float_wav_channels, read_wav, read_wav_channels, reverb_fixture, run_cli, snr_db, srr_db,
                      voice_noise_fixture, write_tone_wav, write_wav, write_wav_tracks)
 
 from voice_enhance_skill import SKILL_ID, __version__
@@ -80,7 +80,10 @@ class StubSkill:
         self.calls.append({"src": os.path.basename(src), "audio_stream": audio_stream, "mono": mono, "sample_rate": sample_rate})
         assert sample_rate is None, "the stub cannot resample"
         rate, ch, x = read_wav(src)
-        write_wav(dst, x, rate, 1 if mono else ch)
+        if mono or ch == 1:
+            write_wav(dst, x, rate, 1)
+        else:                       # every channel as it is, so dual mono and distinct channels stay what they were
+            write_wav_tracks(dst, read_wav_channels(src)[1], rate)
         return {"status": "completed", "output": dst, "probe": self.probe(dst)}
 
 
@@ -193,6 +196,50 @@ class ContractTests(unittest.TestCase):
             self.assertNotIn('"ffmpeg"', text.replace('"ffmpeg", "ffprobe"', ""), f.name)   # media goes through ffmpeg-skill
             for banned in ("hf_hub_download", "snapshot_download", "urllib.request", "requests.", "urlopen", "torch.hub"):
                 self.assertNotIn(banned, text, f"{f.name}: {banned}")
+
+
+class SkillMdTests(unittest.TestCase):
+    """SKILL.md (roadmap step 7, ADR-007) is what an agent reads: it has to agree with the code it describes."""
+
+    def setUp(self):
+        self.text = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+
+    def test_frontmatter_name_and_description(self):
+        m = re.match(r"---\nname: (\S+)\ndescription: (.+)\n---\n", self.text)
+        self.assertIsNotNone(m)
+        # The repository and package name, as in slide-sync-skill, diarization-skill and qc-skill
+        package = re.search(r'^name = "([^"]+)"', (ROOT / "pyproject.toml").read_text(encoding="utf-8"), re.M).group(1)
+        self.assertEqual(m.group(1), package)
+        self.assertIn("Use when", m.group(2))
+        self.assertLess(len(m.group(2)), 1024)
+
+    def test_stays_under_the_30kb_budget(self):
+        # Loaded into every agent session; ffmpeg-skill and imagemagick-skill keep the same budget.
+        self.assertLess(len(self.text.encode("utf-8")), 30_000)
+
+    def test_every_command_has_an_example(self):
+        for t in contract()["tools"]:
+            with self.subTest(t["tool_id"]):
+                self.assertIn(f"`voice-enhance {t['argv'][0]} ", self.text)
+        for cmd in ("doctor", "engines", "contract"):
+            self.assertIn(f"`voice-enhance {cmd} --json`", self.text)
+
+    def test_every_error_code_with_its_exit_code_and_retry(self):
+        rows = dict((c, (int(x), r)) for c, x, r in re.findall(r"^\| `([A-Z_]+)` \| (\d) \| (yes|no) \|", self.text, re.M))
+        self.assertEqual(rows, {c: (x, "yes" if r else "no") for c, (x, r) in ERROR_TABLE.items()})
+
+    def test_lifecycle_48khz_and_install_hints_match_the_code(self):
+        for p in contract()["provides"]:
+            self.assertIn(f"`{p['id']}`", self.text)
+            self.assertIn(f"lifecycle `{p['lifecycle']}`", self.text)
+        self.assertIn(f"{deepfilternet.SAMPLE_RATE // 1000} kHz", self.text)
+        self.assertIn("audio --sample-rate", self.text)
+        for url in (deepfilternet.RELEASES, deepfilternet.MODEL_URL):
+            self.assertIn(url, self.text)
+        for extra in ("[wpe]", "[bleed]"):
+            self.assertIn(f"pip install -e '.{extra}'", self.text)
+        for var in (deepfilternet.ENV_BINARY, deepfilternet.ENV_MODEL):
+            self.assertIn(var, self.text)
 
 
 class EngineRegistryTests(unittest.TestCase):
@@ -621,6 +668,34 @@ class NaraWpeParamTests(unittest.TestCase):
 
 
 @unittest.skipUnless(NUMPY, NEEDS_NUMPY)
+class IndependentChannelsTests(unittest.TestCase):
+    """nara_wpe_engine.independent_basis (ADR-007): which channel directions WPE runs on."""
+
+    def spec(self, channels):
+        import numpy as np
+        rng = np.random.default_rng(3)
+        return np.ascontiguousarray(np.stack(channels(rng.standard_normal((9, 400)) + 1j * rng.standard_normal((9, 400)),
+                                                      rng.standard_normal((9, 400)) + 0j), axis=1))
+
+    def test_independent_channels_are_left_alone(self):
+        import numpy as np
+        self.assertIsNone(nara_wpe_engine.independent_basis(np, self.spec(lambda a, b: [a, b])))
+        self.assertIsNone(nara_wpe_engine.independent_basis(np, self.spec(lambda a, b: [a])))
+
+    def test_copies_and_panned_copies_reduce_to_one(self):
+        import numpy as np
+        for make in (lambda a, b: [a, a], lambda a, b: [a, -0.5 * a], lambda a, b: [a, a + 1e-5 * b, 0.3 * a]):
+            y = self.spec(make)
+            u = nara_wpe_engine.independent_basis(np, y)
+            self.assertEqual(u.shape, (y.shape[1], 1))
+            self.assertTrue(np.allclose(u.conj().T @ u, np.eye(1)))
+
+    def test_silence_has_no_component(self):
+        import numpy as np
+        self.assertEqual(nara_wpe_engine.independent_basis(np, np.zeros((5, 2, 10), dtype=complex)).shape, (2, 0))
+
+
+@unittest.skipUnless(NUMPY, NEEDS_NUMPY)
 class NaraWpeProcessTests(unittest.TestCase):
     """NaraWpeEngine.process through the real worker subprocess, with the fake nara_wpe package."""
 
@@ -796,13 +871,29 @@ class DereverbOpTests(unittest.TestCase):
         """WPE takes any rate and channel count: a 44.1 kHz stereo stream needs no audio --sample-rate (the stub has
         none) and no fold-down; all channels go to one multi-channel WPE call."""
         src, out = os.path.join(self.tmp, "stereo.wav"), os.path.join(self.tmp, "dry.wav")
-        dry = reverb_fixture(src, seconds=0.5, rate=44100, channels=2)
+        dry = reverb_fixture(src, seconds=1.0, rate=44100, channels=2, distinct=True)
         doc = self.run_dereverb(src, out)
         rate, ch, x = read_wav(out)
         self.assertEqual((rate, ch, doc["output"]["channels"], doc["parameters"]["sample_rate"]), (44100, 2, 2, 44100))
         self.assertEqual(fake_wpe_calls(self.site)[0]["shape"][:2], [707, 2])        # 1412-point STFT, 2 channels
+        self.assertEqual((doc["parameters"]["independent_channels"], doc["warnings"]), (2, []))
         self.assertEqual(len(self.skill.calls), 1)
-        self.assertGreater(srr_db(dry, x), srr_db(dry, read_wav(src)[2]) + 6.0)
+        for before, after in zip(read_wav_channels(src)[1], read_float_wav_channels(out)[1]):     # each microphone's own room
+            self.assertGreater(srr_db(dry, after), srr_db(dry, before) + 6.0)
+
+    def test_dual_mono_runs_wpe_on_one_component(self):
+        """ADR-007: two identical channels make WPE's correlation matrix singular (the real wpe_v8 diverged on them in
+        CI). The engine runs WPE on the one independent component and gives both channels the same result."""
+        src, out = os.path.join(self.tmp, "dual.wav"), os.path.join(self.tmp, "dry.wav")
+        dry = reverb_fixture(src, seconds=1.0, rate=16000, channels=2)
+        doc = self.run_dereverb(src, out)
+        self.assertEqual(fake_wpe_calls(self.site)[0]["shape"][:2], [257, 1])
+        self.assertEqual((doc["output"]["channels"], doc["parameters"]["independent_channels"]), (2, 1))
+        self.assertEqual(len(doc["warnings"]), 1)
+        self.assertIn("1 independent signal", doc["warnings"][0])
+        _, (left, right) = read_float_wav_channels(out)
+        self.assertLess(max(abs(a - b) for a, b in zip(left, right)), 1e-6)
+        self.assertGreater(srr_db(dry, left), srr_db(dry, read_wav(src)[2]) + 6.0)
 
     def test_engine_failure_writes_nothing(self):
         src, out = os.path.join(self.tmp, "room.wav"), os.path.join(self.tmp, "dry.wav")

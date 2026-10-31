@@ -24,6 +24,8 @@ ENV_MODEL = "VOICE_ENHANCE_DFN_MODEL"
 MODEL_FILE = "DeepFilterNet3_onnx.tar.gz"
 SUPPORTED = ((0, 5), (0, 6))        # >=0.5, <0.6
 RELEASES = "https://github.com/Rikorose/DeepFilterNet/releases"
+# The model tarball is not a release asset: it is a file of the repository's models/ directory (ADR-007).
+MODEL_URL = "https://github.com/Rikorose/DeepFilterNet/raw/v0.5.6/models/DeepFilterNet3_onnx.tar.gz"
 SAMPLE_RATE = 48000
 ATTEN_LIM_RANGE = (0.0, 100.0)     # dB; the binary's default, 100, means no limit
 ENGINE_TIMEOUT = 3600.0
@@ -52,8 +54,9 @@ class DeepFilterNetEngine(Engine):
     weights_license = "MIT OR Apache-2.0 (checkpoints are files of the same repository)"
     attribution = "DeepFilterNet by Hendrik Schröter (https://github.com/Rikorose/DeepFilterNet), MIT OR Apache-2.0"
     version_range = ">=0.5.0 <0.6.0"
-    install = (f"download the deep-filter binary for your platform and {MODEL_FILE} from {RELEASES} (v0.5.x), then put "
-               f"deep-filter on PATH (or set {ENV_BINARY}) and set {ENV_MODEL} to the model tarball")
+    install = (f"download the deep-filter binary for your platform from {RELEASES} (v0.5.x, for example "
+               f"deep-filter-0.5.6-x86_64-unknown-linux-musl) and {MODEL_FILE} from {MODEL_URL}, then put deep-filter on "
+               f"PATH (or set {ENV_BINARY}) and set {ENV_MODEL} to the model tarball")
     located_by = [f"${ENV_BINARY}", "PATH (deep-filter)", f"${ENV_MODEL}"]
     roadmap_step = 3
 

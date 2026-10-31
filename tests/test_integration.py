@@ -8,17 +8,19 @@ REMUX must leave byte-identical; the skill itself never calls either."""
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 import unittest
 
-from helpers import (FFMPEG_SKILL_DIR, crosstalk_fixture, energy_db, env, fake_deep_filter, fake_model, fake_nara_wpe, fake_wpe_calls,
-                     have_numpy, on_python_path, read_wav, reverb_fixture, run_cli, snr_db, srr_db, voice_noise_fixture, write_tone_wav,
-                     write_wav)
+from helpers import (FFMPEG_SKILL_DIR, best_lag, crosstalk_fixture, energy_db, env, fake_deep_filter, fake_model, fake_nara_wpe,
+                     fake_wpe_calls, have_numpy, on_python_path, read_float_wav_channels, read_wav, read_wav_channels, reverb_fixture,
+                     run_cli, snr_db, srr_db, voice_noise_fixture, write_tone_wav, write_wav)
 
 from voice_enhance_skill.doctor import doctor
 from voice_enhance_skill.engines import get_engine
+from voice_enhance_skill.engines.deepfilternet import build_argv, find_binary
 from voice_enhance_skill.errors import VoiceEnhanceError
 from voice_enhance_skill.ffmpeg_skill import TOOLS_USED, FfmpegSkill
 from voice_enhance_skill.ops import (BleedReduceRequest, DereverbRequest, IsolateRequest, RemuxRequest, bleed_reduce, dereverb, isolate,
@@ -27,6 +29,10 @@ from voice_enhance_skill.ops import (BleedReduceRequest, DereverbRequest, Isolat
 HAVE_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 NO_DEEP_FILTER = {"VOICE_ENHANCE_DEEP_FILTER": os.path.join(tempfile.gettempdir(), "no-such-deep-filter")}
 POSIX = os.name == "posix"
+NO_REAL_DEEP_FILTER = "deep-filter and DeepFilterNet3_onnx.tar.gz are not installed (only CI's engines job installs them, ADR-007)"
+# What the real engines must at least gain on the synthetic fixtures (ADR-007 records what CI measured).
+REAL_ISOLATE_MIN_GAIN_DB = 6.0       # measured +18.2 dB at 0 dB input SNR
+REAL_DEREVERB_MIN_GAIN_DB = 6.0      # measured +13 to +20 dB
 
 
 def real_engine_ok() -> bool:
@@ -150,14 +156,42 @@ class IsolateIntegrationTests(unittest.TestCase):
             self.skill.audio_to_wav(bad, os.path.join(self.tmp, "x.wav"))
         self.assertEqual(e.exception.code, "UNSUPPORTED_MEDIA")
 
-    @unittest.skipUnless(real_engine_ok(), "deep-filter and DeepFilterNet3_onnx.tar.gz are not installed (CI installs no engine, ADR-001)")
+    @unittest.skipUnless(real_engine_ok(), NO_REAL_DEEP_FILTER)
+    def test_real_deep_filter_cli_flags(self):
+        # Every flag of ADR-003's argv is one the installed binary declares (ADR-007 checked them on 0.5.6). Comments,
+        # not docstrings, in the real-engine tests: CI's engines job greps for their names in the verbose log.
+        res = subprocess.run([find_binary(), "--help"], capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        declared = set(re.findall(r"(?<![\w-])(--?[A-Za-z][\w-]*)", res.stdout))
+        used = [a for a in build_argv("deep-filter", "<model>", "<out_dir>", "<input.wav>", 12.0) if a.startswith("-")]
+        self.assertEqual(used, ["-D", "-m", "-o", "--atten-lim-db"])
+        self.assertEqual([a for a in used if a not in declared], [], res.stdout)
+
+    @unittest.skipUnless(real_engine_ok(), NO_REAL_DEEP_FILTER)
     def test_real_deep_filter_raises_snr(self):
         src = os.path.join(self.tmp, "noisy.wav")
         clean = voice_noise_fixture(src, seconds=3.0, snr_db=0.0)
         out = os.path.join(self.tmp, "voice.wav")
         doc = isolate(IsolateRequest(src, out), skill=self.skill)
         self.assertEqual(doc["engine"]["model"], "DeepFilterNet3_onnx.tar.gz")
-        self.assertGreater(snr_db(clean, read_wav(out)[2]), snr_db(clean, read_wav(src)[2]))
+        before, after = snr_db(clean, read_wav(src)[2]), snr_db(clean, read_wav(out)[2])
+        self.assertGreater(after, before + REAL_ISOLATE_MIN_GAIN_DB, (before, after))
+
+    @unittest.skipUnless(real_engine_ok(), NO_REAL_DEEP_FILTER)
+    def test_real_deep_filter_is_sample_aligned(self):
+        # `-D` removes the STFT and lookahead delay: the stem lines up with the clean voice at lag 0, and it ends at
+        # most the delay plus one hop (1440 + 480 samples at 48 kHz) before the input. The search stays within half
+        # the fixture's 140 Hz period (343 samples), where the correlation has a single peak; an uncompensated delay
+        # of 1440 samples would show as a lag of 68.
+        src = os.path.join(self.tmp, "noisy.wav")
+        clean = voice_noise_fixture(src, seconds=2.0, snr_db=10.0)
+        out = os.path.join(self.tmp, "voice.wav")
+        isolate(IsolateRequest(src, out), skill=self.skill)
+        rate, _, stem = read_wav(out)
+        self.assertEqual(rate, 48000)
+        self.assertEqual(best_lag(clean, stem, start=48000, length=12000, max_lag=160), 0)
+        self.assertLessEqual(len(clean) - len(stem), 1920)
+        self.assertGreaterEqual(len(clean) - len(stem), 0)
 
 
 @unittest.skipUnless(FFMPEG_SKILL_DIR and HAVE_FFMPEG, "needs an ffmpeg-skill checkout and ffmpeg/ffprobe on PATH")
@@ -175,7 +209,7 @@ class DereverbIntegrationTests(unittest.TestCase):
     @unittest.skipUnless(have_numpy(), "needs numpy: the fake nara_wpe computes on it")
     def test_second_stream_of_a_video_srr_rises(self):
         room = os.path.join(self.tmp, "room.wav")
-        dry = reverb_fixture(room, seconds=1.0, rate=48000, channels=2)
+        dry = reverb_fixture(room, seconds=1.0, rate=48000, channels=2, distinct=True)
         video = two_stream_video(self.tmp, room)
         out = os.path.join(self.tmp, "dry.wav")
         site = fake_nara_wpe(os.path.join(self.tmp, "engine"))
@@ -187,8 +221,10 @@ class DereverbIntegrationTests(unittest.TestCase):
         self.assertEqual((doc["input"]["has_video"], doc["input"]["audio_stream_count"]), (True, 2))
         self.assertEqual([st["flags"] for st in doc["steps"]], [["--audio-stream", "1"]])
         self.assertEqual(fake_wpe_calls(site)[0]["shape"][:2], [769, 2])
-        before, after = srr_db(dry, read_wav(room)[2]), srr_db(dry, x)
-        self.assertGreater(after, before + 6.0, (before, after))     # and the decoy (stream 0) was not the one processed
+        self.assertEqual((doc["parameters"]["independent_channels"], doc["warnings"]), (2, []))
+        for k, (wet, out_ch) in enumerate(zip(read_wav_channels(room)[1], read_float_wav_channels(out)[1])):
+            before, after = srr_db(dry, wet), srr_db(dry, out_ch)
+            self.assertGreater(after, before + 6.0, (k, before, after))     # and the decoy (stream 0) was not the one processed
         self.assertAlmostEqual(doc["output"]["duration"], 1.0, delta=0.05)
         self.assertEqual(doc["provenance"]["ffmpeg_skill"]["version"], self.skill.info().version)
 
@@ -202,14 +238,40 @@ class DereverbIntegrationTests(unittest.TestCase):
         self.assertEqual((rc, doc["ok"], doc["output"]["sample_rate"], doc["output"]["channels"]), (0, True, 44100, 1), doc)
         self.assertAlmostEqual(doc["output"]["duration"], 0.5, delta=0.02)
 
-    @unittest.skipUnless(real_wpe_ok(), "nara_wpe is not installed (CI installs no engine, ADR-001)")
+    @unittest.skipUnless(real_wpe_ok(), "nara_wpe is not installed (only CI's engines job installs it, ADR-007)")
     def test_real_nara_wpe_raises_srr(self):
         src = os.path.join(self.tmp, "room.wav")
         dry = reverb_fixture(src, seconds=2.0, rate=16000)
         out = os.path.join(self.tmp, "dry.wav")
         doc = dereverb(DereverbRequest(src, out), skill=self.skill)
         self.assertEqual(doc["engine"]["id"], "nara_wpe")
-        self.assertGreater(srr_db(dry, read_wav(out)[2]), srr_db(dry, read_wav(src)[2]))
+        before, after = srr_db(dry, read_wav(src)[2]), srr_db(dry, read_wav(out)[2])
+        self.assertGreater(after, before + REAL_DEREVERB_MIN_GAIN_DB, (before, after))
+
+    @unittest.skipUnless(real_wpe_ok(), "nara_wpe is not installed (only CI's engines job installs it, ADR-007)")
+    def test_real_nara_wpe_dual_mono(self):
+        # ADR-007: on two identical channels the real wpe_v8 diverged (SRR -0.8 -> -48 dB in CI) before the engine
+        # learnt to run WPE on the independent components only.
+        src = os.path.join(self.tmp, "dual.wav")
+        dry = reverb_fixture(src, seconds=2.0, rate=48000, channels=2)
+        out = os.path.join(self.tmp, "dry.wav")
+        doc = dereverb(DereverbRequest(src, out), skill=self.skill)
+        self.assertEqual((doc["parameters"]["independent_channels"], len(doc["warnings"])), (1, 1))
+        _, (left, right) = read_float_wav_channels(out)
+        self.assertLess(max(abs(a - b) for a, b in zip(left, right)), 1e-6)
+        before, after = srr_db(dry, read_wav(src)[2]), srr_db(dry, left)
+        self.assertGreater(after, before + REAL_DEREVERB_MIN_GAIN_DB, (before, after))
+
+    @unittest.skipUnless(real_wpe_ok(), "nara_wpe is not installed (only CI's engines job installs it, ADR-007)")
+    def test_real_nara_wpe_distinct_stereo(self):
+        src = os.path.join(self.tmp, "pair.wav")
+        dry = reverb_fixture(src, seconds=2.0, rate=48000, channels=2, distinct=True)
+        out = os.path.join(self.tmp, "dry.wav")
+        doc = dereverb(DereverbRequest(src, out), skill=self.skill)
+        self.assertEqual((doc["parameters"]["independent_channels"], doc["warnings"]), (2, []))
+        for k, (wet, out_ch) in enumerate(zip(read_wav_channels(src)[1], read_float_wav_channels(out)[1])):
+            before, after = srr_db(dry, wet), srr_db(dry, out_ch)
+            self.assertGreater(after, before + REAL_DEREVERB_MIN_GAIN_DB, (k, before, after))
 
 
 def mic_video(directory: str, wavs: list) -> str:
