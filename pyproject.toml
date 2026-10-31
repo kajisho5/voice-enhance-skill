@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voice-enhance-skill"
+version = "0.1.0"
+description = "AI voice isolation, dereverberation and mic-bleed reduction for recorded speech: local, offline engines behind availability checks; media work through ffmpeg-skill."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [{name = "kajisho5"}]
+keywords = ["speech-enhancement", "voice-isolation", "dereverberation", "deepfilternet", "wpe", "offline", "agent-skill", "video-production"]
+dependencies = []
+
+[project.optional-dependencies]
+# DEREVERB engine (ADR-001). The ISOLATE engine is the external `deep-filter` binary, not a Python package.
+wpe = ["nara_wpe>=0.0.11,<0.1", "numpy>=1.21"]
+
+[project.scripts]
+voice-enhance = "voice_enhance_skill.cli:main"
+
+[project.urls]
+Repository = "https://github.com/kajisho5/voice-enhance-skill"
+
+[tool.setuptools.packages.find]
+where = ["src"]
