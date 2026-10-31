@@ -5,7 +5,7 @@ Written from a read-only audit of this repository on 2026-10-30. Each step below
 
 ## Where it stands
 
-Scaffold: one-line README, no package.
+Skeleton 0.1.0 ([#3](https://github.com/kajisho5/voice-enhance-skill/pull/3)): engines chosen (ADR-001), `contract` / `doctor` / `engines`, engine registry and worker. No op is implemented yet.
 
 ## What this repository owns
 
@@ -23,9 +23,9 @@ None. Expected: ffmpeg-skill probe before/after, audio --replace to put the clea
 
 ## Steps
 
-- [ ] **1. Engine selection ADR** — candidates to verify: DeepFilterNet, Demucs/HTDemucs, Resemble-Enhance, VoiceFixer, nara_wpe -- licence of code AND weights, CPU feasibility, Japanese speech
+- [x] **1. Engine selection ADR** ([#3](https://github.com/kajisho5/voice-enhance-skill/pull/3), [docs/decisions.md](docs/decisions.md) ADR-001: DeepFilterNet3 `deep-filter` for ISOLATE, nara_wpe for DEREVERB, no AI engine for BLEED_REDUCE; the `ecosystem.json` engines value is written in the ADR and **pending** in AI-video-production-OS) — candidates to verify: DeepFilterNet, Demucs/HTDemucs, Resemble-Enhance, VoiceFixer, nara_wpe -- licence of code AND weights, CPU feasibility, Japanese speech
   - Done when: ADR merged; ecosystem.json engines filled
-- [ ] **2. Package skeleton + contract/doctor** — modelled on transcription-skill (engine registry, worker subprocess, --offline)
+- [x] **2. Package skeleton + contract/doctor** ([#3](https://github.com/kajisho5/voice-enhance-skill/pull/3), ADR-002: publishes_contract, lifecycle_declared, dependency_version_ranges, no_unsafe_shell_out and doctor_status PASS in `tests/`; doctor reports both engines `MISSING` when absent) — modelled on transcription-skill (engine registry, worker subprocess, --offline)
   - Done when: OS static checks PASS; doctor reports a missing engine as MISSING
 - [ ] **3. ISOLATE op** — voice stem via the engine worker
   - Done when: SNR rises on a synthetic voice+noise fixture
