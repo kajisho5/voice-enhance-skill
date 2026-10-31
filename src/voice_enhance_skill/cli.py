@@ -6,8 +6,12 @@ Exit code: 0 on success; doctor exits 1 when its status is `fail`; an error exit
   voice-enhance contract --json     the contract (alias: skill --json)
   voice-enhance doctor --json       engines, ffmpeg-skill, ops readiness [--offline] [--ffmpeg-skill DIR]
   voice-enhance engines --json      registered engines with status and licences [--offline]
+  voice-enhance isolate <media> -o <out.wav> --json
+                                    voice stem of one audio stream, 48 kHz mono WAV (ADR-003) [--audio-stream N]
+                                    [--engine deepfilternet] [--atten-lim-db N] [--timeout S] [--overwrite]
+                                    [--ffmpeg-skill DIR] [--offline]
 
-The ops (isolate, dereverb, bleed-reduce) arrive in roadmap steps 3-5."""
+dereverb and bleed-reduce arrive in roadmap steps 4-5."""
 from __future__ import annotations
 
 import argparse
@@ -19,6 +23,8 @@ from . import PACKAGE_NAME, SKILL_ID, __version__
 from .contract import contract
 from .doctor import doctor, engines_report
 from .errors import VoiceEnhanceError
+from .ops import IsolateRequest, isolate
+from .service import DEFAULT_TIMEOUT
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,6 +42,17 @@ def build_parser() -> argparse.ArgumentParser:
     e = sub.add_parser("engines", help="registered engines: status, version, licences, attribution")
     e.add_argument("--offline", action="store_true")
     e.add_argument("--json", action="store_true")
+    i = sub.add_parser("isolate", help="voice stem of a recording, noise and background removed (DeepFilterNet3); 48 kHz mono WAV")
+    i.add_argument("input", help="media file (video or audio); never modified")
+    i.add_argument("-o", "--output", required=True, help="output .wav (refused if it exists, unless --overwrite)")
+    i.add_argument("--audio-stream", type=int, default=0, help="which audio stream, 0-based in file order (default 0)")
+    i.add_argument("--engine", help="engine id (default: deepfilternet)")
+    i.add_argument("--atten-lim-db", type=float, help="limit the noise attenuation to N dB, 0 < N <= 100 (default: no limit)")
+    i.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help=f"engine time limit in seconds (default {DEFAULT_TIMEOUT:g})")
+    i.add_argument("--overwrite", action="store_true", help="allow replacing an existing output")
+    i.add_argument("--ffmpeg-skill", help="ffmpeg-skill checkout directory")
+    i.add_argument("--offline", action="store_true", help="no network (every registered engine already needs none)")
+    i.add_argument("--json", action="store_true")
     return ap
 
 
@@ -51,6 +68,11 @@ def _human(doc: Dict[str, Any]) -> None:
     if doc.get("error"):
         err = doc["error"]
         sys.stderr.write(f"error [{err['code']}]: {err['message']}\n")
+    elif "op" in doc and "output" in doc:
+        o, e = doc["output"], doc["engine"]
+        print(f"wrote {o['path']} ({o['duration']:.2f}s, {o['sample_rate']} Hz, {o['channels']} ch) with {e['id']} {e['version']}")
+        for w in doc.get("warnings", []):
+            print(f"  warning: {w}")
     elif "checks" in doc:
         print(f"{PACKAGE_NAME} {__version__}: {doc['status']}")
         fs = doc["checks"]["ffmpeg_skill"]
@@ -84,6 +106,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.cmd == "engines":
             _emit({"ok": True, "skill": {"id": SKILL_ID, "version": __version__}, "offline": bool(args.offline),
                    "engines": engines_report(offline=args.offline)}, as_json)
+            return 0
+        if args.cmd == "isolate":
+            _emit(isolate(IsolateRequest(input_path=args.input, output_path=args.output, audio_stream=args.audio_stream,
+                                         engine=args.engine, timeout=args.timeout, overwrite=args.overwrite,
+                                         atten_lim_db=args.atten_lim_db, ffmpeg_skill_dir=args.ffmpeg_skill,
+                                         offline=args.offline)), as_json)
             return 0
     except VoiceEnhanceError as e:
         _emit({"ok": False, "skill": {"id": SKILL_ID, "version": __version__}, "error": e.to_dict()}, as_json)

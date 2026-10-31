@@ -1,17 +1,19 @@
-"""Shared test helpers: paths, the CLI runner, a fake `deep-filter` executable and a WAV writer. Nothing here is
-part of the package; the fake binary is never registered anywhere but a test's environment."""
+"""Shared test helpers: paths, the CLI runner, a fake `deep-filter` executable, WAV writers and readers, the synthetic
+voice+noise fixture and an SNR measure. Nothing here is part of the package; the fake binary is never registered
+anywhere but a test's environment."""
 from __future__ import annotations
 
 import io
 import json
 import math
 import os
+import random
 import struct
 import sys
 import wave
 from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -55,13 +57,154 @@ def env(**values: Optional[str]) -> Iterator[None]:
                 os.environ[k] = v
 
 
-def fake_deep_filter(directory: str, version: str = "0.5.6") -> str:
-    """A POSIX executable that answers `--version` like the real binary ("deep-filter 0.5.6")."""
+# The program behind the fake `deep-filter` (modes other than "fail"). It records its argv to argv.json next to
+# itself, checks the input like the real binary (48 kHz WAV), and then, per mode:
+#   lowpass    a zero-phase low-pass (2nd-order Butterworth at 2 kHz, run forward and backward): it removes most of
+#              a white noise and keeps the fixture's voice band, so the SNR against the clean voice rises
+#   sleep      writes its pid to pid and sleeps (timeout / process-group tests)
+#   nooutput   exits 0 without writing anything
+#   wrongrate  writes a 16 kHz file
+FAKE_PROGRAM = r"""
+import json, math, os, struct, sys, time, wave
+mode, args = sys.argv[1], sys.argv[2:]
+here = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(here, "argv.json"), "w") as fh:
+    json.dump(args, fh)
+opts, files, i = {}, [], 0
+while i < len(args):
+    if args[i] in ("-m", "-o", "--atten-lim-db"):
+        opts[args[i]] = args[i + 1]; i += 2
+    elif args[i].startswith("-"):
+        opts[args[i]] = True; i += 1
+    else:
+        files.append(args[i]); i += 1
+if mode == "sleep":
+    with open(os.path.join(here, "pid"), "w") as fh:
+        fh.write(str(os.getpid()))
+    time.sleep(60)
+    sys.exit(0)
+if "-m" not in opts or len(files) != 1:
+    sys.stderr.write("usage: deep-filter -m MODEL -o DIR FILE\n"); sys.exit(2)
+with wave.open(files[0], "rb") as w:
+    rate, ch, width, n = w.getframerate(), w.getnchannels(), w.getsampwidth(), w.getnframes()
+    raw = w.readframes(n)
+if rate != 48000:
+    sys.stderr.write("Error: input sample rate %d does not match the model (48000)\n" % rate); sys.exit(1)
+if mode == "nooutput":
+    sys.exit(0)
+x = [v / 32768.0 for v in struct.unpack("<%dh" % (n * ch), raw)][::ch]
+def biquad(sig, fc=2000.0, fs=48000.0, q=0.7071067811865476):
+    w0 = 2 * math.pi * fc / fs; al = math.sin(w0) / (2 * q); c = math.cos(w0); a0 = 1 + al
+    b0, b1, b2, a1, a2 = (1 - c) / 2 / a0, (1 - c) / a0, (1 - c) / 2 / a0, -2 * c / a0, (1 - al) / a0
+    y, x1, x2, y1, y2 = [], 0.0, 0.0, 0.0, 0.0
+    for v in sig:
+        o = b0 * v + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+        x2, x1, y2, y1 = x1, v, y1, o
+        y.append(o)
+    return y
+y = biquad(biquad(x)[::-1])[::-1]
+out_rate = 16000 if mode == "wrongrate" else 48000
+os.makedirs(opts.get("-o", "out"), exist_ok=True)
+with wave.open(os.path.join(opts.get("-o", "out"), os.path.basename(files[0])), "wb") as w:
+    w.setnchannels(1); w.setsampwidth(2); w.setframerate(out_rate)
+    w.writeframes(struct.pack("<%dh" % len(y), *[max(-32768, min(32767, int(round(v * 32767)))) for v in y]))
+"""
+
+
+def fake_deep_filter(directory: str, version: str = "0.5.6", mode: str = "fail") -> str:
+    """A POSIX executable that answers `--version` like the real binary ("deep-filter 0.5.6"). mode "fail" exits 9
+    on anything else; the other modes run FAKE_PROGRAM (see above)."""
     path = os.path.join(directory, "deep-filter")
+    if mode == "fail":
+        tail = "exit 9\n"
+    else:
+        program = os.path.join(directory, "fake_deep_filter.py")
+        with open(program, "w", encoding="utf-8") as fh:
+            fh.write(FAKE_PROGRAM)
+        tail = f"exec '{sys.executable}' '{program}' {mode} \"$@\"\n"
     with open(path, "w", encoding="utf-8") as fh:
-        fh.write(f"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'deep-filter {version}'; exit 0; fi\nexit 9\n")
+        fh.write(f"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'deep-filter {version}'; exit 0; fi\n{tail}")
     os.chmod(path, 0o755)
     return path
+
+
+def fake_model(directory: str) -> str:
+    model = os.path.join(directory, "DeepFilterNet3_onnx.tar.gz")
+    with open(model, "wb") as fh:
+        fh.write(b"\x1f\x8b fake model")
+    return model
+
+
+def write_wav(path: str, samples: List[float], rate: int = 48000, channels: int = 1) -> str:
+    """16-bit PCM; `samples` is mono in [-1, 1], duplicated to every channel."""
+    with wave.open(path, "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(b"".join(struct.pack("<h", max(-32768, min(32767, int(round(v * 32767))))) * channels for v in samples))
+    return path
+
+
+def voice_noise_fixture(path: str, seconds: float = 1.5, rate: int = 48000, snr_db: float = 0.0, channels: int = 1,
+                        seed: int = 7) -> List[float]:
+    """The synthetic voice+noise fixture: a voiced "speech" signal (140 Hz fundamental, harmonics to 840 Hz, a 4 Hz
+    syllable envelope) plus white noise at `snr_db`. Writes the noisy mix and returns the clean voice at the same
+    scale, so snr_db(clean, read_wav(x)) measures any processed version of it."""
+    rng = random.Random(seed)
+    n = int(seconds * rate)
+    voice = [(0.5 - 0.5 * math.cos(2 * math.pi * 4 * i / rate)) *
+             sum(math.sin(2 * math.pi * 140 * k * i / rate) / k for k in range(1, 7)) for i in range(n)]
+    noise = [rng.gauss(0.0, 1.0) for _ in range(n)]
+    pv, pn = sum(v * v for v in voice) / n, sum(v * v for v in noise) / n
+    g = math.sqrt(pv / (pn * 10 ** (snr_db / 10)))
+    mix = [v + g * e for v, e in zip(voice, noise)]
+    scale = 0.5 / max(abs(v) for v in mix)
+    write_wav(path, [v * scale for v in mix], rate, channels)
+    return [v * scale for v in voice]
+
+
+def read_wav(path: str) -> Tuple[int, int, List[float]]:
+    """(sample rate, channels, mono samples in [-1, 1]) for PCM 16/24/32-bit and IEEE float WAV (the real deep-filter's
+    output format is not pinned down here, and the stdlib wave module reads integer PCM only)."""
+    data = Path(path).read_bytes()
+    if data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        raise ValueError(f"{path} is not a RIFF/WAVE file")
+    pos, fmt, payload = 12, None, b""
+    while pos + 8 <= len(data):
+        cid, size = data[pos:pos + 4], struct.unpack("<I", data[pos + 4:pos + 8])[0]
+        body = data[pos + 8:pos + 8 + size]
+        if cid == b"fmt ":
+            fmt = struct.unpack("<HHIIHH", body[:16])
+            if fmt[0] == 0xFFFE:
+                fmt = (struct.unpack("<H", body[24:26])[0],) + fmt[1:]
+        elif cid == b"data":
+            payload = body
+        pos += 8 + size + (size & 1)
+    if fmt is None:
+        raise ValueError(f"{path} has no fmt chunk")
+    tag, ch, rate, _, _, bits = fmt
+    width = bits // 8
+    count = len(payload) // width
+    if tag == 3 and bits == 32:
+        vals = list(struct.unpack(f"<{count}f", payload[:count * 4]))
+    elif tag == 1 and bits == 16:
+        vals = [v / 32768.0 for v in struct.unpack(f"<{count}h", payload[:count * 2])]
+    elif tag == 1 and bits == 32:
+        vals = [v / 2147483648.0 for v in struct.unpack(f"<{count}i", payload[:count * 4])]
+    elif tag == 1 and bits == 24:
+        vals = [int.from_bytes(payload[i:i + 3], "little", signed=True) / 8388608.0 for i in range(0, count * 3, 3)]
+    else:
+        raise ValueError(f"{path}: unsupported WAV format {tag}/{bits} bit")
+    frames = len(vals) // ch
+    return rate, ch, [sum(vals[f * ch:(f + 1) * ch]) / ch for f in range(frames)]
+
+
+def snr_db(clean: List[float], test: List[float]) -> float:
+    """SNR of `test` against the clean reference, in dB, over their common length."""
+    n = min(len(clean), len(test))
+    signal = sum(c * c for c in clean[:n])
+    error = sum((t - c) ** 2 for c, t in zip(clean[:n], test[:n]))
+    return 10 * math.log10(signal / max(error, 1e-20))
 
 
 def write_tone_wav(path: str, seconds: float = 1.0, rate: int = 48000, freq: float = 440.0) -> str:

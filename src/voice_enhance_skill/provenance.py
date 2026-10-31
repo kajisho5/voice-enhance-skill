@@ -22,7 +22,7 @@ def build_provenance(*, op: str, engine: Dict[str, Any], input_path: str, output
     return {
         "skill": {"id": SKILL_ID, "version": __version__},
         "op": op,
-        "engine": {k: engine.get(k) for k in ("id", "version", "model", "code_license", "weights_license", "attribution",
+        "engine": {k: engine.get(k) for k in ("id", "version", "model", "model_sha256", "code_license", "weights_license", "attribution",
                                               "execution_mode", "deterministic")},
         "input": {"sha256": sha256_file(input_path)},
         "output": {"sha256": sha256_file(output_path)} if output_path else None,
