@@ -1,6 +1,7 @@
 """Unit tests: contract, typed errors, engine registry and availability checks (with a fake deep-filter binary and
-mocked package lookups), the worker subprocess, doctor, provenance and the OS registry conformance checks. No
-engine, no weights and no ffmpeg are needed; nothing is downloaded."""
+mocked package lookups), the worker subprocess, the ISOLATE op (fake deep-filter, a stub ffmpeg-skill that reads and
+writes WAV with the stdlib), doctor, provenance and the OS registry conformance checks. No engine, no weights and no
+ffmpeg are needed; nothing is downloaded."""
 from __future__ import annotations
 
 import json
@@ -13,16 +14,18 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from helpers import OS_DIR, ROOT, env, fake_deep_filter, run_cli, write_tone_wav
+from helpers import (OS_DIR, ROOT, env, fake_deep_filter, fake_model, read_wav, run_cli, snr_db, voice_noise_fixture, write_tone_wav,
+                     write_wav)
 
 from voice_enhance_skill import SKILL_ID, __version__
 from voice_enhance_skill.contract import CAPABILITY_IDS, contract
 from voice_enhance_skill.doctor import doctor
 from voice_enhance_skill.engines import DEFAULT_ENGINE, engine_ids, engines_for, get_engine
-from voice_enhance_skill.engines import nara_wpe_engine
+from voice_enhance_skill.engines import deepfilternet, nara_wpe_engine
 from voice_enhance_skill.engines.base import OPS, EngineRequest, EngineResult, parse_version
 from voice_enhance_skill.errors import ERROR_TABLE, EXIT_CODES, VoiceEnhanceError
-from voice_enhance_skill.ffmpeg_skill import FLAGS_USED, FfmpegSkill, parse_contract
+from voice_enhance_skill.ffmpeg_skill import FLAGS_USED, OPTIONAL_FLAGS, TOOLS_USED, FfmpegSkill, parse_contract
+from voice_enhance_skill.ops import IsolateRequest, check_paths, isolate, select_engine, select_stream
 from voice_enhance_skill.procs import TIMEOUT_EXIT, run_process_group
 from voice_enhance_skill.provenance import build_provenance, sha256_file
 from voice_enhance_skill.service import run_engine
@@ -30,6 +33,43 @@ from voice_enhance_skill.service import run_engine
 POSIX = os.name == "posix"
 NO_DEEP_FILTER = {"VOICE_ENHANCE_DEEP_FILTER": os.path.join(tempfile.gettempdir(), "no-such-deep-filter"),
                   "VOICE_ENHANCE_DFN_MODEL": None}
+
+
+def fake_ffmpeg_contract(drop=None, extra=()):
+    """An ffmpeg-skill contract document declaring FLAGS_USED (minus `drop`, plus `extra` (tool, flag) pairs)."""
+    tools = []
+    for name, flags in FLAGS_USED.items():
+        props = {f: {"type": "string"} for f in flags if (name, f) != drop}
+        props.update({f: {"type": "integer"} for t, f in extra if t == name})
+        tools.append({"name": name, "audio_only": True, "input_schema": {"properties": props}})
+    return {"skill": {"version": "2.22.4"}, "contract_version": "1.0", "tools": tools}
+
+
+class StubSkill:
+    """Stands in for ffmpeg-skill in unit tests: probe and audio_to_wav on WAV files with the stdlib (no FFmpeg). It
+    cannot resample, so it never declares audio --sample-rate."""
+
+    def __init__(self):
+        self._info = parse_contract(fake_ffmpeg_contract(), Path("stub-ffmpeg-skill"))
+        self.calls = []
+
+    def info(self):
+        return self._info
+
+    def probe(self, path):
+        try:
+            rate, ch, x = read_wav(path)
+        except ValueError as e:
+            raise VoiceEnhanceError("UNSUPPORTED_MEDIA", str(e))
+        a = {"codec": "pcm_s16le", "sample_rate": rate, "channels": ch}
+        return {"format": "wav", "duration": len(x) / rate, "video": None, "audio": a, "audio_streams": [dict(a, index=0)]}
+
+    def audio_to_wav(self, src, dst, audio_stream=None, mono=False, sample_rate=None, timeout=None):
+        self.calls.append({"src": os.path.basename(src), "audio_stream": audio_stream, "mono": mono, "sample_rate": sample_rate})
+        assert sample_rate is None, "the stub cannot resample"
+        rate, ch, x = read_wav(src)
+        write_wav(dst, x, rate, 1 if mono else ch)
+        return {"status": "completed", "output": dst, "probe": self.probe(dst)}
 
 
 class ErrorTests(unittest.TestCase):
@@ -61,7 +101,8 @@ class ContractTests(unittest.TestCase):
         for p in c["provides"]:
             self.assertEqual(set(p), {"id", "lifecycle", "tool_id"})
             self.assertIn(p["tool_id"], tool_ids)
-            self.assertEqual(p["lifecycle"], "PROPOSED")       # no op is implemented in this release (ADR-002)
+            # ISOLATE is implemented (step 3, ADR-003); the others are declared only (ADR-002)
+            self.assertEqual(p["lifecycle"], "EXPERIMENTAL" if p["id"] == "voice.isolate" else "PROPOSED", p)
         for d in c["dependencies"]:
             self.assertIsInstance(d["version_range"], str)
             self.assertFalse(d["version_range"].replace(".", "").isdigit(), d)
@@ -78,6 +119,20 @@ class ContractTests(unittest.TestCase):
             self.assertFalse(spec["network_required"])
         ff = next(d for d in c["dependencies"] if d["id"] == "ffmpeg-skill")
         self.assertEqual(ff["flags"], {t: list(f) for t, f in FLAGS_USED.items()})
+        self.assertEqual(ff["optional_flags"], {t: list(f) for t, f in OPTIONAL_FLAGS.items()})
+        self.assertEqual(ff["tools"], ["probe", "audio"])       # join refuses one clip, so it is not used (ADR-003)
+        self.assertEqual(list(TOOLS_USED), ["probe", "audio"])
+
+    def test_isolate_tool_entry(self):
+        tool = next(t for t in contract()["tools"] if t["tool_id"] == f"{SKILL_ID}/isolate")
+        self.assertTrue(tool["implemented"])
+        self.assertEqual((tool["schema"], tool["output"]["sample_rate"], tool["output"]["channels"]),
+                         (f"{SKILL_ID}/isolate@1", 48000, 1))
+        for flag in ("--audio-stream", "--atten-lim-db", "--timeout", "--overwrite", "--ffmpeg-skill", "--offline"):
+            self.assertTrue(any(a.startswith("[" + flag) for a in tool["argv"]), flag)
+        for t in contract()["tools"]:
+            if t["tool_id"] in (f"{SKILL_ID}/dereverb", f"{SKILL_ID}/bleed-reduce"):
+                self.assertFalse(t["implemented"])
 
     def test_version_comes_from_pyproject(self):
         want = re.search(r'^version = "([^"]+)"', (ROOT / "pyproject.toml").read_text(encoding="utf-8"), re.M).group(1)
@@ -217,15 +272,26 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual((e.exception.code, e.exception.exit_code), ("ENGINE_UNAVAILABLE", 3))
 
     @unittest.skipUnless(POSIX, "the fake deep-filter is a shell script")
-    def test_installed_engine_reaches_process_through_the_worker(self):
+    def test_installed_engine_failure_comes_back_through_the_worker(self):
         with tempfile.TemporaryDirectory() as tmp:
-            model = os.path.join(tmp, "DeepFilterNet3_onnx.tar.gz")
-            Path(model).write_bytes(b"x")
-            with env(VOICE_ENHANCE_DEEP_FILTER=fake_deep_filter(tmp), VOICE_ENHANCE_DFN_MODEL=model), \
+            src = write_tone_wav(os.path.join(tmp, "input.wav"), 0.2)
+            with env(VOICE_ENHANCE_DEEP_FILTER=fake_deep_filter(tmp), VOICE_ENHANCE_DFN_MODEL=fake_model(tmp)), \
                     self.assertRaises(VoiceEnhanceError) as e:
-                run_engine("deepfilternet", EngineRequest("isolate", "a.wav", "b.wav"), 60, tmp)
-        self.assertEqual(e.exception.code, "NOT_IMPLEMENTED")      # step 3 implements process()
-        self.assertEqual(e.exception.details["op"], "isolate")
+                run_engine("deepfilternet", EngineRequest("isolate", src, os.path.join(tmp, "b.wav")), 60, tmp)
+        self.assertEqual((e.exception.code, e.exception.details["exit_code"]), ("ENGINE_FAILED", 9))   # mode "fail" exits 9
+
+    def test_dereverb_is_not_implemented_yet(self):
+        with mock.patch.object(nara_wpe_engine, "_found", return_value=True), \
+                mock.patch.object(nara_wpe_engine, "_dist_version", return_value="0.0.11"), \
+                self.assertRaises(VoiceEnhanceError) as e:
+            get_engine("nara_wpe").process(EngineRequest("dereverb", "a.wav", "b.wav"))
+        self.assertEqual((e.exception.code, e.exception.details["op"]), ("NOT_IMPLEMENTED", "dereverb"))   # roadmap step 4
+
+    @unittest.skipUnless(POSIX, "process groups are POSIX here")
+    def test_new_group_false_keeps_the_child_in_the_callers_group(self):
+        probe = [sys.executable, "-c", "import os; print(os.getpgrp())"]
+        self.assertEqual(int(run_process_group(probe, 30, new_group=False)[1]), os.getpgrp())
+        self.assertNotEqual(int(run_process_group(probe, 30)[1]), os.getpgrp())
 
     def test_engine_timeout_is_retryable(self):
         with tempfile.TemporaryDirectory() as tmp, \
@@ -242,13 +308,253 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(e.exception.code, "ENGINE_FAILED")
 
 
+def _pid_alive(pid):
+    """Linux: a process that exists and is not a zombie (a killed child may linger as one until it is reaped)."""
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return False
+    return state != "Z"
+
+
+class DeepFilterNetProcessTests(unittest.TestCase):
+    """DeepFilterNetEngine.process through the real worker subprocess, with a fake deep-filter."""
+
+    def test_argv(self):
+        self.assertEqual(deepfilternet.build_argv("deep-filter", "m.tar.gz", "/o", "/i.wav"),
+                         ["deep-filter", "-D", "-m", "m.tar.gz", "-o", "/o", "/i.wav"])
+        self.assertEqual(deepfilternet.build_argv("deep-filter", "m.tar.gz", "/o", "/i.wav", 12.0),
+                         ["deep-filter", "-D", "-m", "m.tar.gz", "-o", "/o", "--atten-lim-db", "12", "/i.wav"])
+
+    @unittest.skipUnless(POSIX, "the fake deep-filter is a shell script")
+    def test_stem_through_the_worker_raises_snr(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "input.wav")
+            clean = voice_noise_fixture(src, seconds=1.0)
+            model = fake_model(tmp)
+            out = os.path.join(tmp, "stem.wav")
+            with env(VOICE_ENHANCE_DEEP_FILTER=fake_deep_filter(tmp, mode="lowpass"), VOICE_ENHANCE_DFN_MODEL=model):
+                res = run_engine("deepfilternet", EngineRequest("isolate", src, out, params={"atten_lim_db": 30.0}), 60, tmp)
+            argv = json.loads(Path(tmp, "argv.json").read_text(encoding="utf-8"))
+            self.assertEqual(argv, ["-D", "-m", model, "-o", os.path.join(tmp, "deep_filter_out"), "--atten-lim-db", "30", src])
+            self.assertEqual((res.output_path, res.engine_version, res.model), (out, "0.5.6", "DeepFilterNet3_onnx.tar.gz"))
+            self.assertEqual(res.extra["model_sha256"], sha256_file(model))
+            self.assertEqual(res.extra["argv"][:2], ["deep-filter", "-D"])
+            self.assertNotIn(tmp, json.dumps(res.extra))                 # no local paths in what is published
+            before, after = snr_db(clean, read_wav(src)[2]), snr_db(clean, read_wav(out)[2])
+            self.assertGreater(after, before + 6.0, (before, after))
+
+    @unittest.skipUnless(POSIX, "the fake deep-filter is a shell script")
+    def test_no_output_is_invalid_result(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = write_tone_wav(os.path.join(tmp, "input.wav"), 0.2)
+            with env(VOICE_ENHANCE_DEEP_FILTER=fake_deep_filter(tmp, mode="nooutput"), VOICE_ENHANCE_DFN_MODEL=fake_model(tmp)), \
+                    self.assertRaises(VoiceEnhanceError) as e:
+                run_engine("deepfilternet", EngineRequest("isolate", src, os.path.join(tmp, "b.wav")), 60, tmp)
+        self.assertEqual(e.exception.code, "INVALID_RESULT")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "process state is read from /proc")
+    def test_timeout_kills_the_binary_with_the_worker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = write_tone_wav(os.path.join(tmp, "input.wav"), 0.2)
+            with env(VOICE_ENHANCE_DEEP_FILTER=fake_deep_filter(tmp, mode="sleep"), VOICE_ENHANCE_DFN_MODEL=fake_model(tmp)), \
+                    self.assertRaises(VoiceEnhanceError) as e:
+                run_engine("deepfilternet", EngineRequest("isolate", src, os.path.join(tmp, "b.wav")), 3.0, tmp)
+            self.assertEqual((e.exception.code, e.exception.retryable), ("ENGINE_TIMEOUT", True))
+            pid = int(Path(tmp, "pid").read_text())
+            deadline = time.time() + 10
+            while _pid_alive(pid) and time.time() < deadline:
+                time.sleep(0.1)
+            self.assertFalse(_pid_alive(pid), "deep-filter outlived the worker")
+
+
+class IsolatePlanningTests(unittest.TestCase):
+    """The checks ISOLATE makes before any media work."""
+
+    def test_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = write_tone_wav(os.path.join(tmp, "in.wav"), 0.1)
+            out = os.path.join(tmp, "out.wav")
+            self.assertEqual(check_paths(src, out, False), (os.path.abspath(src), os.path.abspath(out)))
+            cases = [((os.path.join(tmp, "nope.wav"), out, False), "INPUT_NOT_FOUND"),
+                     ((src, src, True), "OUTPUT_IS_INPUT"),
+                     ((src, os.path.join(tmp, "out.mp3"), False), "INVALID_ARGUMENT"),
+                     ((src, os.path.join(tmp, "no-dir", "out.wav"), False), "INVALID_ARGUMENT")]
+            for args, code in cases:
+                with self.assertRaises(VoiceEnhanceError) as e:
+                    check_paths(*args)
+                self.assertEqual(e.exception.code, code, args)
+            Path(out).write_bytes(b"x")
+            with self.assertRaises(VoiceEnhanceError) as e:
+                check_paths(src, out, False)
+            self.assertEqual(e.exception.code, "OUTPUT_EXISTS")
+            self.assertEqual(check_paths(src, out, True)[1], os.path.abspath(out))
+            os.mkdir(os.path.join(tmp, "d.wav"))
+            with self.assertRaises(VoiceEnhanceError) as e:
+                check_paths(src, os.path.join(tmp, "d.wav"), True)
+            self.assertEqual(e.exception.code, "INVALID_ARGUMENT")
+
+    def test_engine_selection(self):
+        with env(**NO_DEEP_FILTER), self.assertRaises(VoiceEnhanceError) as e:
+            select_engine("isolate", None)
+        self.assertEqual((e.exception.code, e.exception.details["engine"]), ("ENGINE_UNAVAILABLE", "deepfilternet"))
+        self.assertIn("releases", e.exception.details["install"])
+        with self.assertRaises(VoiceEnhanceError) as e:
+            select_engine("isolate", "nara_wpe")
+        self.assertEqual(e.exception.code, "INVALID_ARGUMENT")
+        with self.assertRaises(VoiceEnhanceError) as e:
+            select_engine("isolate", "demucs")
+        self.assertEqual(e.exception.code, "ENGINE_UNAVAILABLE")
+        with self.assertRaises(VoiceEnhanceError) as e:
+            select_engine("bleed_reduce", None)
+        self.assertEqual(e.exception.code, "ENGINE_UNAVAILABLE")
+
+    @unittest.skipUnless(POSIX, "the fake deep-filter is a shell script")
+    def test_engine_without_model_is_model_not_found(self):
+        with tempfile.TemporaryDirectory() as tmp, env(VOICE_ENHANCE_DEEP_FILTER=fake_deep_filter(tmp), VOICE_ENHANCE_DFN_MODEL=None), \
+                self.assertRaises(VoiceEnhanceError) as e:
+            select_engine("isolate", None)
+        self.assertEqual((e.exception.code, e.exception.exit_code), ("MODEL_NOT_FOUND", 3))
+
+    def test_stream_selection(self):
+        facts = {"audio": {"sample_rate": 48000}, "audio_streams": [{"index": 0, "channels": 1}, {"index": 1, "channels": 2}]}
+        self.assertEqual(select_stream(facts, 1, "v.mp4"), ({"index": 1, "channels": 2}, 2))
+        with self.assertRaises(VoiceEnhanceError) as e:
+            select_stream(facts, 2, "v.mp4")
+        self.assertEqual((e.exception.code, e.exception.details["audio_stream_count"]), ("INVALID_ARGUMENT", 2))
+        with self.assertRaises(VoiceEnhanceError) as e:
+            select_stream({"audio": None, "audio_streams": []}, 0, "silent.mp4")
+        self.assertEqual(e.exception.code, "UNSUPPORTED_MEDIA")
+        self.assertEqual(select_stream({"audio": {"channels": 1}}, 0, "old-probe.wav")[1], 1)   # probe without audio_streams
+
+    def test_numbers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = write_tone_wav(os.path.join(tmp, "in.wav"), 0.1)
+            for kw in ({"timeout": 0}, {"audio_stream": -1}, {"atten_lim_db": 0}, {"atten_lim_db": 101}):
+                with self.assertRaises(VoiceEnhanceError) as e:
+                    isolate(IsolateRequest(src, os.path.join(tmp, "o.wav"), **kw), skill=StubSkill())
+                self.assertEqual(e.exception.code, "INVALID_ARGUMENT", kw)
+
+
+@unittest.skipUnless(POSIX, "the fake deep-filter is a shell script")
+class IsolateOpTests(unittest.TestCase):
+    """ISOLATE end to end with the fake deep-filter and the stub ffmpeg-skill."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+        self.engine_dir = os.path.join(self.tmp, "engine")
+        os.mkdir(self.engine_dir)
+        self.model = fake_model(self.engine_dir)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def run_isolate(self, src, out, mode="lowpass", **kw):
+        with env(VOICE_ENHANCE_DEEP_FILTER=fake_deep_filter(self.engine_dir, mode=mode), VOICE_ENHANCE_DFN_MODEL=self.model):
+            return isolate(IsolateRequest(src, out, **kw), skill=self.skill)
+
+    def assert_no_leftovers(self):
+        self.assertEqual([n for n in os.listdir(self.tmp) if n.startswith(".voice-enhance-")], [])
+
+    def test_voice_noise_fixture_snr_rises(self):
+        self.skill = StubSkill()
+        src, out = os.path.join(self.tmp, "noisy.wav"), os.path.join(self.tmp, "voice.wav")
+        clean = voice_noise_fixture(src)
+        src_sha = sha256_file(src)
+        doc = self.run_isolate(src, out, atten_lim_db=40)
+        self.assertEqual(sha256_file(src), src_sha)                       # the input is never modified
+        rate, ch, stem = read_wav(out)
+        self.assertEqual((rate, ch), (48000, 1))
+        before, after = snr_db(clean, read_wav(src)[2]), snr_db(clean, stem)
+        self.assertGreater(after, before + 6.0, (before, after))
+        self.assertEqual((doc["schema"], doc["ok"], doc["op"], doc["capability"]), (f"{SKILL_ID}/isolate@1", True, "isolate", "voice.isolate"))
+        self.assertEqual((doc["output"]["path"], doc["output"]["sample_rate"], doc["output"]["channels"]), (out, 48000, 1))
+        self.assertEqual((doc["input"]["audio_stream"], doc["input"]["audio_stream_count"], doc["input"]["has_video"]), (0, 1, False))
+        self.assertEqual(doc["engine"], {"id": "deepfilternet", "version": "0.5.6", "model": "DeepFilterNet3_onnx.tar.gz",
+                                         "model_sha256": sha256_file(self.model)})
+        self.assertEqual((doc["parameters"]["atten_lim_db"], doc["parameters"]["compensate_delay"]), (40.0, True))
+        prov = doc["provenance"]
+        self.assertEqual((prov["op"], prov["input"]["sha256"], prov["output"]["sha256"]), ("isolate", src_sha, sha256_file(out)))
+        self.assertEqual(prov["engine"]["model_sha256"], sha256_file(self.model))
+        self.assertEqual(prov["ffmpeg_skill"]["version"], "2.22.4")
+        self.assertEqual(self.skill.calls, [{"src": "noisy.wav", "audio_stream": 0, "mono": False, "sample_rate": None}])
+        self.assertEqual(doc["warnings"], [])
+        json.dumps(doc, allow_nan=False)
+        self.assert_no_leftovers()
+
+    def test_stereo_is_folded_down_in_a_second_pass(self):
+        self.skill = StubSkill()
+        src, out = os.path.join(self.tmp, "stereo.wav"), os.path.join(self.tmp, "voice.wav")
+        clean = voice_noise_fixture(src, seconds=1.0, channels=2)
+        doc = self.run_isolate(src, out)
+        self.assertEqual([(c["src"], c["audio_stream"], c["mono"]) for c in self.skill.calls],
+                         [("stereo.wav", 0, False), ("extracted.wav", None, True)])
+        self.assertEqual([st["flags"] for st in doc["steps"]], [["--audio-stream", "0"], ["--mono"]])
+        self.assertIn("folded down to mono", doc["warnings"][0])
+        self.assertGreater(snr_db(clean, read_wav(out)[2]), snr_db(clean, read_wav(src)[2]) + 6.0)
+
+    def test_other_rate_without_audio_sample_rate_is_refused_before_any_work(self):
+        self.skill = StubSkill()
+        src = write_wav(os.path.join(self.tmp, "cd.wav"), [0.1] * 4410, rate=44100)
+        with self.assertRaises(VoiceEnhanceError) as e:
+            self.run_isolate(src, os.path.join(self.tmp, "voice.wav"))
+        self.assertEqual((e.exception.code, e.exception.details["needs_flag"], e.exception.details["input_sample_rate"]),
+                         ("FFMPEG_SKILL_UNAVAILABLE", "sample_rate", 44100))
+        self.assertEqual(self.skill.calls, [])
+        self.assertFalse(os.path.exists(os.path.join(self.engine_dir, "argv.json")))
+        self.assert_no_leftovers()
+
+    def test_engine_output_failing_validation_writes_nothing(self):
+        self.skill = StubSkill()
+        src, out = os.path.join(self.tmp, "noisy.wav"), os.path.join(self.tmp, "voice.wav")
+        voice_noise_fixture(src, seconds=0.5)
+        with self.assertRaises(VoiceEnhanceError) as e:
+            self.run_isolate(src, out, mode="wrongrate")
+        self.assertEqual(e.exception.code, "INVALID_RESULT")
+        self.assertIn("sample rate 16000", e.exception.message)
+        self.assertFalse(os.path.exists(out))
+        self.assert_no_leftovers()
+
+    def test_overwrite(self):
+        self.skill = StubSkill()
+        src, out = os.path.join(self.tmp, "noisy.wav"), os.path.join(self.tmp, "voice.wav")
+        voice_noise_fixture(src, seconds=0.5)
+        Path(out).write_bytes(b"old")
+        with self.assertRaises(VoiceEnhanceError) as e:
+            self.run_isolate(src, out)
+        self.assertEqual(e.exception.code, "OUTPUT_EXISTS")
+        self.assertEqual(Path(out).read_bytes(), b"old")
+        self.run_isolate(src, out, overwrite=True)
+        self.assertEqual(read_wav(out)[:2], (48000, 1))
+
+    def test_cli_isolate_json(self):
+        self.skill = StubSkill()
+        src, out = os.path.join(self.tmp, "noisy.wav"), os.path.join(self.tmp, "voice.wav")
+        voice_noise_fixture(src, seconds=0.5)
+        with env(VOICE_ENHANCE_DEEP_FILTER=fake_deep_filter(self.engine_dir, mode="lowpass"), VOICE_ENHANCE_DFN_MODEL=self.model), \
+                mock.patch("voice_enhance_skill.ops.FfmpegSkill.locate", return_value=self.skill):
+            rc, doc = run_cli("isolate", src, "-o", out, "--json")
+            rc2, err = run_cli("isolate", src, "-o", out, "--json")
+        self.assertEqual((rc, doc["ok"], doc["output"]["path"]), (0, True, out))
+        self.assertEqual((rc2, err["ok"], err["error"]["code"]), (EXIT_CODES["OUTPUT_EXISTS"], False, "OUTPUT_EXISTS"))
+
+
+class IsolateCliErrorTests(unittest.TestCase):
+    def test_errors_are_one_json_document(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, doc = run_cli("isolate", os.path.join(tmp, "nope.mp4"), "-o", os.path.join(tmp, "o.wav"), "--json")
+            self.assertEqual((rc, doc["ok"], doc["error"]["code"]), (2, False, "INPUT_NOT_FOUND"))
+            src = write_tone_wav(os.path.join(tmp, "in.wav"), 0.1)
+            with env(**NO_DEEP_FILTER):
+                rc, doc = run_cli("isolate", src, "-o", os.path.join(tmp, "o.wav"), "--json")
+            self.assertEqual((rc, doc["error"]["code"], doc["error"]["retryable"]), (3, "ENGINE_UNAVAILABLE", False))
+            self.assertFalse(os.path.exists(os.path.join(tmp, "o.wav")))
+
+
 class FfmpegSkillContractTests(unittest.TestCase):
     def doc(self, drop=None):
-        tools = []
-        for name, flags in FLAGS_USED.items():
-            props = {f: {"type": "string"} for f in flags if (name, f) != drop}
-            tools.append({"name": name, "audio_only": True, "input_schema": {"properties": props}})
-        return {"skill": {"version": "2.22.4"}, "contract_version": "1.0", "tools": tools}
+        return fake_ffmpeg_contract(drop)
 
     def test_capability_detection(self):
         info = parse_contract(self.doc(), Path("."))
@@ -258,9 +564,13 @@ class FfmpegSkillContractTests(unittest.TestCase):
         self.assertFalse(bad.supported)
         self.assertIn("replace", bad.problems[0])
         missing_tool = self.doc()
-        missing_tool["tools"] = [t for t in missing_tool["tools"] if t["name"] != "join"]
-        self.assertIn("'join' is missing", parse_contract(missing_tool, Path("."))
+        missing_tool["tools"] = [t for t in missing_tool["tools"] if t["name"] != "audio"]
+        self.assertIn("'audio' is missing", parse_contract(missing_tool, Path("."))
                       .problems[0])
+        self.assertFalse(info.takes_flag("audio", "sample_rate"))
+        self.assertEqual(info.to_dict()["optional_flags"], {"audio": {"sample_rate": False}})
+        with_rate = parse_contract(fake_ffmpeg_contract(extra=[("audio", "sample_rate")]), Path("."))
+        self.assertTrue(with_rate.supported and with_rate.takes_flag("audio", "sample_rate"))
         self.assertTrue(parse_contract(dict(self.doc(), contract_version="2.0"), Path(".")).warnings)
 
     def test_locate_explicit_dir_is_never_replaced(self):
@@ -284,6 +594,8 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual((d["status"], d["ok"]), ("fail", False))
         self.assertEqual(set(d["checks"]["operations"]), set(OPS))
         self.assertFalse(any(o["ready"] for o in d["checks"]["operations"].values()))
+        self.assertEqual({op: o["implemented"] for op, o in d["checks"]["operations"].items()},
+                         {"isolate": True, "dereverb": False, "bleed_reduce": False})
         self.assertEqual((rc, cli_doc["status"], cli_doc["offline"]), (1, "fail", True))
 
     def test_engines_command(self):

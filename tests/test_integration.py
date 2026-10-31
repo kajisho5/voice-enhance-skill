@@ -1,21 +1,43 @@
 """Integration with a real ffmpeg-skill checkout and a real FFmpeg: locate it, check every tool and flag this skill
-emits against its live contract, run its doctor, and probe a WAV through it. Skipped without a checkout
-(VOICE_ENHANCE_FFMPEG_SKILL_DIR or ../ffmpeg-skill); CI's integration job always has one."""
+emits against its live contract, run its doctor, probe a WAV through it, and run ISOLATE end to end on a video with
+two audio streams (fake deep-filter; the real engine only when it is installed). Skipped without a checkout
+(VOICE_ENHANCE_FFMPEG_SKILL_DIR or ../ffmpeg-skill); CI's integration job always has one. FFmpeg is called directly
+here only to build the fixtures; the skill itself never does."""
 from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 
-from helpers import FFMPEG_SKILL_DIR, env, run_cli, write_tone_wav
+from helpers import (FFMPEG_SKILL_DIR, env, fake_deep_filter, fake_model, read_wav, run_cli, snr_db, voice_noise_fixture,
+                     write_tone_wav)
 
 from voice_enhance_skill.doctor import doctor
+from voice_enhance_skill.engines import get_engine
 from voice_enhance_skill.errors import VoiceEnhanceError
 from voice_enhance_skill.ffmpeg_skill import TOOLS_USED, FfmpegSkill
+from voice_enhance_skill.ops import IsolateRequest, isolate
 
 HAVE_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 NO_DEEP_FILTER = {"VOICE_ENHANCE_DEEP_FILTER": os.path.join(tempfile.gettempdir(), "no-such-deep-filter")}
+POSIX = os.name == "posix"
+
+
+def real_engine_ok() -> bool:
+    return get_engine("deepfilternet").inspect()["status"] == "OK"
+
+
+def two_stream_video(directory: str, voice_wav: str) -> str:
+    """A small video (FFV1) whose audio stream 0 is a 48 kHz mono decoy tone and stream 1 the stereo voice+noise WAV,
+    both PCM so the fixture is not altered by a lossy codec."""
+    decoy = write_tone_wav(os.path.join(directory, "decoy.wav"), seconds=1.0, freq=3000.0)
+    out = os.path.join(directory, "talk.mkv")
+    subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "color=c=gray:s=64x64:r=25:d=1",
+                    "-i", decoy, "-i", voice_wav, "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "ffv1",
+                    "-c:a", "pcm_s16le", "-shortest", out], check=True, stdin=subprocess.DEVNULL)
+    return out
 
 
 @unittest.skipUnless(FFMPEG_SKILL_DIR and HAVE_FFMPEG, "needs an ffmpeg-skill checkout and ffmpeg/ffprobe on PATH")
@@ -48,6 +70,86 @@ class FfmpegSkillIntegrationTests(unittest.TestCase):
         self.assertEqual(d["checks"]["engines"]["deepfilternet"]["status"], "MISSING")
         self.assertIn(d["status"], ("degraded", "ok"))
         self.assertEqual((rc, cli_doc["status"]), (0, d["status"]))
+
+
+@unittest.skipUnless(FFMPEG_SKILL_DIR and HAVE_FFMPEG, "needs an ffmpeg-skill checkout and ffmpeg/ffprobe on PATH")
+class IsolateIntegrationTests(unittest.TestCase):
+    """ISOLATE through the real ffmpeg-skill (probe, audio) and the real worker."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+        self.skill = FfmpegSkill.locate(str(FFMPEG_SKILL_DIR))
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def fake_engine(self, mode="lowpass"):
+        engine_dir = os.path.join(self.tmp, "engine")
+        os.makedirs(engine_dir, exist_ok=True)
+        return env(VOICE_ENHANCE_DEEP_FILTER=fake_deep_filter(engine_dir, mode=mode), VOICE_ENHANCE_DFN_MODEL=fake_model(engine_dir))
+
+    @unittest.skipUnless(POSIX, "the fake deep-filter is a shell script")
+    def test_second_stream_of_a_video_snr_rises(self):
+        voice = os.path.join(self.tmp, "voice_noise.wav")
+        clean = voice_noise_fixture(voice, seconds=1.0, channels=2)
+        video = two_stream_video(self.tmp, voice)
+        out = os.path.join(self.tmp, "voice.wav")
+        with self.fake_engine():
+            doc = isolate(IsolateRequest(video, out, audio_stream=1), skill=self.skill)
+        rate, ch, stem = read_wav(out)
+        self.assertEqual((rate, ch), (48000, 1))
+        self.assertEqual((doc["input"]["has_video"], doc["input"]["audio_stream_count"], doc["input"]["audio"]["channels"]), (True, 2, 2))
+        # stream 1 has 2 channels and stream 0 has 1: the fold-down is a second pass on the extracted WAV (ADR-003)
+        self.assertEqual([st["flags"] for st in doc["steps"]], [["--audio-stream", "1"], ["--mono"]])
+        self.assertEqual(doc["steps"][-1]["result"], {"sample_rate": 48000, "channels": 1})
+        before, after = snr_db(clean, read_wav(voice)[2]), snr_db(clean, stem)
+        self.assertGreater(after, before + 6.0, (before, after))     # and the decoy (stream 0) was not the one cleaned
+        self.assertAlmostEqual(doc["output"]["duration"], 1.0, delta=0.05)
+        self.assertEqual(doc["provenance"]["ffmpeg_skill"]["version"], self.skill.info().version)
+
+    @unittest.skipUnless(POSIX, "the fake deep-filter is a shell script")
+    def test_other_sample_rate(self):
+        src = write_tone_wav(os.path.join(self.tmp, "cd.wav"), seconds=0.5, rate=44100, freq=300.0)
+        out = os.path.join(self.tmp, "voice.wav")
+        with self.fake_engine():
+            if self.skill.info().takes_flag("audio", "sample_rate"):
+                doc = isolate(IsolateRequest(src, out), skill=self.skill)
+                self.assertEqual((doc["output"]["sample_rate"], doc["steps"][-1]["flags"]), (48000, ["--sample-rate", "48000"]))
+            else:
+                with self.assertRaises(VoiceEnhanceError) as e:
+                    isolate(IsolateRequest(src, out), skill=self.skill)
+                self.assertEqual((e.exception.code, e.exception.details["input_sample_rate"]), ("FFMPEG_SKILL_UNAVAILABLE", 44100))
+                self.assertFalse(os.path.exists(out))
+
+    @unittest.skipUnless(POSIX, "the fake deep-filter is a shell script")
+    def test_cli_against_real_ffmpeg_skill(self):
+        src = os.path.join(self.tmp, "noisy.wav")
+        voice_noise_fixture(src, seconds=0.5)
+        out = os.path.join(self.tmp, "voice.wav")
+        with self.fake_engine():
+            rc, doc = run_cli("isolate", src, "-o", out, "--ffmpeg-skill", str(FFMPEG_SKILL_DIR), "--json")
+            rc2, err = run_cli("isolate", src, "-o", out, "--audio-stream", "3", "--overwrite", "--ffmpeg-skill", str(FFMPEG_SKILL_DIR),
+                               "--json")
+        self.assertEqual((rc, doc["ok"], doc["output"]["sample_rate"]), (0, True, 48000))
+        self.assertEqual((rc2, err["error"]["code"]), (2, "INVALID_ARGUMENT"))
+
+    def test_audio_tool_refuses_non_media(self):
+        bad = os.path.join(self.tmp, "not-media.wav")
+        with open(bad, "w", encoding="utf-8") as fh:
+            fh.write("not audio")
+        with self.assertRaises(VoiceEnhanceError) as e:
+            self.skill.audio_to_wav(bad, os.path.join(self.tmp, "x.wav"))
+        self.assertEqual(e.exception.code, "UNSUPPORTED_MEDIA")
+
+    @unittest.skipUnless(real_engine_ok(), "deep-filter and DeepFilterNet3_onnx.tar.gz are not installed (CI installs no engine, ADR-001)")
+    def test_real_deep_filter_raises_snr(self):
+        src = os.path.join(self.tmp, "noisy.wav")
+        clean = voice_noise_fixture(src, seconds=3.0, snr_db=0.0)
+        out = os.path.join(self.tmp, "voice.wav")
+        doc = isolate(IsolateRequest(src, out), skill=self.skill)
+        self.assertEqual(doc["engine"]["model"], "DeepFilterNet3_onnx.tar.gz")
+        self.assertGreater(snr_db(clean, read_wav(out)[2]), snr_db(clean, read_wav(src)[2]))
 
 
 if __name__ == "__main__":

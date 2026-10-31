@@ -5,7 +5,7 @@ Written from a read-only audit of this repository on 2026-10-30. Each step below
 
 ## Where it stands
 
-Skeleton 0.1.0 ([#3](https://github.com/kajisho5/voice-enhance-skill/pull/3)): engines chosen (ADR-001), `contract` / `doctor` / `engines`, engine registry and worker. No op is implemented yet.
+Skeleton 0.1.0 ([#3](https://github.com/kajisho5/voice-enhance-skill/pull/3)): engines chosen (ADR-001), `contract` / `doctor` / `engines`, engine registry and worker. ISOLATE works ([#4](https://github.com/kajisho5/voice-enhance-skill/pull/4), ADR-003, `EXPERIMENTAL`); DEREVERB and BLEED_REDUCE are not implemented yet.
 
 ## What this repository owns
 
@@ -13,13 +13,13 @@ Skeleton 0.1.0 ([#3](https://github.com/kajisho5/voice-enhance-skill/pull/3)): e
 
 | Owned job | Status | Note |
 |---|---|---|
-| 声の分離(AI) | missing |  |
+| 声の分離(AI) | experimental | `voice-enhance isolate` ([#4](https://github.com/kajisho5/voice-enhance-skill/pull/4)); not yet measured with the real engine on Japanese speech |
 | 残響除去 | missing |  |
 | マイク被り低減 | missing |  |
 
 ## Wiring
 
-None. Expected: ffmpeg-skill probe before/after, audio --replace to put the cleaned stem back.
+ffmpeg-skill `probe` (input facts, stem validation) and `audio` (stream extraction, mono fold-down) are used by ISOLATE ([#4](https://github.com/kajisho5/voice-enhance-skill/pull/4)). Still to come: `audio --replace` to put the cleaned stem back (step 6). Gaps to report to ffmpeg-skill: `audio --sample-rate` (inputs not at 48 kHz are refused until it exists), and `audio --mono` reading the first audio stream's channel count instead of the one `--audio-stream` picks (ADR-003).
 
 ## Steps
 
@@ -27,7 +27,7 @@ None. Expected: ffmpeg-skill probe before/after, audio --replace to put the clea
   - Done when: ADR merged; ecosystem.json engines filled
 - [x] **2. Package skeleton + contract/doctor** ([#3](https://github.com/kajisho5/voice-enhance-skill/pull/3), ADR-002: publishes_contract, lifecycle_declared, dependency_version_ranges, no_unsafe_shell_out and doctor_status PASS in `tests/`; doctor reports both engines `MISSING` when absent) — modelled on transcription-skill (engine registry, worker subprocess, --offline)
   - Done when: OS static checks PASS; doctor reports a missing engine as MISSING
-- [ ] **3. ISOLATE op** — voice stem via the engine worker
+- [x] **3. ISOLATE op** ([#4](https://github.com/kajisho5/voice-enhance-skill/pull/4), ADR-003: `voice-enhance isolate`, input prepared with ffmpeg-skill `audio`, `deep-filter -D` in the worker's process group, stem validated through `probe`; SNR rises by more than 6 dB on the synthetic voice+noise fixture through a fake `deep-filter`, including on stream 1 of a two-stream video through the real ffmpeg-skill; the real-engine variant of the test runs only where the engine is installed) — voice stem via the engine worker
   - Done when: SNR rises on a synthetic voice+noise fixture
 - [ ] **4. DEREVERB op**
   - Done when: same pattern

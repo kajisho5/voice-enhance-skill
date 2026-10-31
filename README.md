@@ -17,7 +17,7 @@
 
 AI voice isolation, dereverberation and mic-bleed reduction for recorded speech, for the [AI Video Production OS](https://github.com/kajisho5/AI-video-production-OS) (department 音 / Audio). Local and offline: engines are optional, never downloaded by the skill, and every media step (probe, format conversion, putting the cleaned audio back into the video) goes through [ffmpeg-skill](https://github.com/kajisho5/ffmpeg-skill).
 
-**Status: skeleton (0.1.0).** `contract`, `doctor` and `engines` work; the ops are declared (`PROPOSED`) and arrive in [roadmap](ECOSYSTEM_ROADMAP.md) steps 3-5.
+**Status: 0.1.0, unreleased.** `isolate` works (`EXPERIMENTAL`, [ADR-003](docs/decisions.md)). `contract`, `doctor` and `engines` work. `dereverb` and `bleed-reduce` are declared (`PROPOSED`) and arrive in [roadmap](ECOSYSTEM_ROADMAP.md) steps 4-5.
 
 | Op | Capability | Engine ([ADR-001](docs/decisions.md)) | Licence (code / weights) | Step |
 |---|---|---|---|---|
@@ -32,7 +32,15 @@ pip install -e .                     # stdlib only, Python >= 3.9
 voice-enhance doctor                 # what is installed, what is MISSING, and how to get it
 voice-enhance engines --json         # engines with status, version, licences, attribution
 voice-enhance contract --json        # machine-readable contract (alias: skill --json)
+voice-enhance isolate talk.mp4 -o talk_voice.wav --json            # voice stem of audio stream 0, 48 kHz mono WAV
+voice-enhance isolate talk.mp4 -o voice.wav --audio-stream 1 --atten-lim-db 20 --json
 ```
+
+## isolate
+
+`isolate` picks one audio stream (`--audio-stream`, 0-based, default 0) and has ffmpeg-skill extract it as PCM WAV. A stream with more than one channel is folded down to mono in a second ffmpeg-skill pass. The engine runs on that WAV in the worker, and the stem is checked through ffmpeg-skill/probe (48 kHz, mono, same duration) before it is renamed into place. The output is always a 48 kHz mono `.wav`, sample-aligned with the input (`deep-filter -D`). The input is never modified, and an existing output is never replaced without `--overwrite`. `--atten-lim-db N` limits how far the background is pushed down (default: no limit). `--timeout` (default 3600 s) kills the engine and the worker's whole process group.
+
+The engine needs 48 kHz. A stream at another rate is converted only when the ffmpeg-skill checkout declares `audio --sample-rate`. Without that flag, `isolate` stops with `FFMPEG_SKILL_UNAVAILABLE` before doing any work, and the input has to be converted to 48 kHz first.
 
 ## Engines (optional)
 
@@ -43,7 +51,7 @@ voice-enhance contract --json        # machine-readable contract (alias: skill -
 
 ## ffmpeg-skill
 
-Located from `--ffmpeg-skill`, `VOICE_ENHANCE_FFMPEG_SKILL_DIR`, `VIDEO_AGENT_FFMPEG_SKILL_DIR`, `~/.claude/skills/ffmpeg-skill`, `./vendor/ffmpeg-skill` or `../ffmpeg-skill`. Compatibility is checked tool by tool and flag by flag against its contract (`probe`, `join --sample-rate --channels`, `audio --replace --audio-stream --overwrite`), not by version number.
+Located from `--ffmpeg-skill`, `VOICE_ENHANCE_FFMPEG_SKILL_DIR`, `VIDEO_AGENT_FFMPEG_SKILL_DIR`, `~/.claude/skills/ffmpeg-skill`, `./vendor/ffmpeg-skill` or `../ffmpeg-skill`. Compatibility is checked tool by tool and flag by flag against its contract (`probe`, `audio --audio-stream --mono --replace --overwrite`, plus the optional `audio --sample-rate`), not by version number.
 
 ## JSON and errors
 
@@ -55,7 +63,7 @@ With `--json`, stdout holds exactly one JSON document. Failures are `{"ok": fals
 python -m unittest discover -s tests -v
 ```
 
-Unit tests need no engine, no weights and no FFmpeg (fake `deep-filter`, mocked package lookups). The integration tests run against a real ffmpeg-skill checkout (`VOICE_ENHANCE_FFMPEG_SKILL_DIR` or `../ffmpeg-skill`) and FFmpeg; the OS registry conformance checks run when `AI_VIDEO_PRODUCTION_OS_DIR` (or `../AI-video-production-OS`) is present.
+Unit tests need no engine, no weights and no FFmpeg (fake `deep-filter`, mocked package lookups, a stdlib stub of ffmpeg-skill for `isolate`). The SNR check runs on a synthetic voice+noise fixture; the real `deep-filter` version of it runs only when the engine is installed. The integration tests run against a real ffmpeg-skill checkout (`VOICE_ENHANCE_FFMPEG_SKILL_DIR` or `../ffmpeg-skill`) and FFmpeg; the OS registry conformance checks run when `AI_VIDEO_PRODUCTION_OS_DIR` (or `../AI-video-production-OS`) is present.
 
 ## Licence
 

@@ -8,14 +8,21 @@ from . import PACKAGE_NAME, SKILL_ID, __version__
 from .doctor import DOCTOR_SCHEMA, IMPLEMENTED_OPS, OP_STEP
 from .engines import DEFAULT_ENGINE, engine_ids, get_engine
 from .errors import ERROR_TABLE
-from .ffmpeg_skill import FLAGS_USED, SUPPORTED_CONTRACT_VERSION, TOOLS_USED
+from .ffmpeg_skill import FLAGS_USED, OPTIONAL_FLAGS, SUPPORTED_CONTRACT_VERSION, TOOLS_USED
+from .ops import ISOLATE_RATE, ISOLATE_SCHEMA
 
 CONTRACT_VERSION = "1.0"
 CAPABILITY_IDS = {"isolate": "voice.isolate", "dereverb": "voice.dereverb", "bleed_reduce": "voice.bleed_reduce"}
 _OP_TOOLS = {
     "isolate": {"description": "Voice stem of a recording with noise and background removed (AI, DeepFilterNet3)",
                 "argv": ["isolate", "<media>", "-o <out.wav>", "[--audio-stream 0]", "[--engine deepfilternet]",
-                         "[--timeout 3600]", "[--overwrite]", "--json"]},
+                         "[--atten-lim-db <0-100>]", "[--timeout 3600]", "[--overwrite]", "[--ffmpeg-skill <dir>]", "[--offline]",
+                         "--json"],
+                "schema": ISOLATE_SCHEMA,
+                "output": {"format": "wav", "sample_rate": ISOLATE_RATE, "channels": 1,
+                           "alignment": "sample-aligned with the input (deep-filter -D compensates its delay)"},
+                "result_keys": ["schema", "ok", "op", "capability", "skill", "output", "input", "engine", "parameters", "steps",
+                                "provenance", "warnings"]},
     "dereverb": {"description": "Speech with room reverberation reduced (WPE, nara_wpe)",
                  "argv": ["dereverb", "<media>", "-o <out.wav>", "[--audio-stream 0]", "[--engine nara_wpe]",
                           "[--timeout 3600]", "[--overwrite]", "--json"]},
@@ -48,6 +55,7 @@ def contract() -> Dict[str, Any]:
         {"id": "ffmpeg-skill", "kind": "skill", "required": True, "for": [CAPABILITY_IDS[o] for o in CAPABILITY_IDS],
          "version_range": "any release whose contract declares the tools and flags below (capability detection)",
          "tools": list(TOOLS_USED), "flags": {t: list(f) for t, f in FLAGS_USED.items()},
+         "optional_flags": {t: list(f) for t, f in OPTIONAL_FLAGS.items()},
          "contract_version": SUPPORTED_CONTRACT_VERSION,
          "located_by": ["--ffmpeg-skill", "$VOICE_ENHANCE_FFMPEG_SKILL_DIR", "$VIDEO_AGENT_FFMPEG_SKILL_DIR",
                         "~/.claude/skills/ffmpeg-skill", "./vendor/ffmpeg-skill", "../ffmpeg-skill"]},
@@ -78,7 +86,7 @@ def contract() -> Dict[str, Any]:
                     "selection_adr": "docs/decisions.md ADR-001",
                     "optional": True,
                     "statuses": ["OK", "MISSING", "INCOMPATIBLE"]},
-        "provenance": {"fields": ["skill", "op", "engine.id", "engine.version", "engine.model", "engine.code_license",
+        "provenance": {"fields": ["skill", "op", "engine.id", "engine.version", "engine.model", "engine.model_sha256", "engine.code_license",
                                   "engine.weights_license", "engine.attribution", "input.sha256", "output.sha256", "parameters",
                                   "ffmpeg_skill.version", "network"],
                        "status": "OBSERVED"},
