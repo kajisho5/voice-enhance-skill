@@ -37,7 +37,7 @@ ffmpeg-skill `probe` (input facts, stem validation) and `audio` (stream extracti
   - Done when: video stream byte-identical
 - [x] **7. SKILL.md, CI (3 OSes unit, Linux engine job)** ([#8](https://github.com/kajisho5/voice-enhance-skill/pull/8), ADR-007: `SKILL.md` checked against the code by unit tests; the unit job on Linux, macOS and Windows × Python 3.9 / 3.12; a Linux `engines` job with the real `deep-filter` 0.5.6 + DeepFilterNet3 (pinned SHA-256) and nara_wpe 0.0.11, where every real-engine test must run and pass. Measured: ISOLATE SNR 0 → 18.2 dB, DEREVERB SRR -0.8 → 19.0 dB. The `deep-filter` flags were as assumed; the real `wpe_v8` diverged on dual mono, fixed by running WPE on the independent channel components)
   - Done when: CI green
-- [ ] **8. (agent side) adapter + SkillSpec**
+- [x] **8. (agent side) adapter + SkillSpec** — done in video-production-agent [#88](https://github.com/kajisho5/video-production-agent/pull/88) (ADR-073)
   - Done when: tracked in video-production-agent
 
 ---
