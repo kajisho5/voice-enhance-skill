@@ -1,14 +1,16 @@
 """Unit tests: contract, typed errors, engine registry and availability checks (with a fake deep-filter binary and
 mocked package lookups), the worker subprocess, the ISOLATE op (fake deep-filter, a stub ffmpeg-skill that reads and
-writes WAV with the stdlib), the DEREVERB op (a fake nara_wpe package on NumPy, the same stub ffmpeg-skill), doctor,
-provenance and the OS registry conformance checks. No engine, no weights and no ffmpeg are needed; nothing is
-downloaded. The DEREVERB engine tests need NumPy (the fake nara_wpe computes on it) and are skipped without it."""
+writes WAV with the stdlib), the DEREVERB op (a fake nara_wpe package on NumPy, the same stub ffmpeg-skill), the
+BLEED_REDUCE op (the crosstalk engine on NumPy, the same stub plus one that reads each channel of a WAV as an audio
+stream), doctor, provenance and the OS registry conformance checks. No engine, no weights and no ffmpeg are needed;
+nothing is downloaded. The DEREVERB and BLEED_REDUCE engine tests need NumPy and are skipped without it."""
 from __future__ import annotations
 
 import json
 import math
 import os
 import re
+import shutil
 import struct
 import sys
 import tempfile
@@ -18,19 +20,20 @@ import wave
 from pathlib import Path
 from unittest import mock
 
-from helpers import (OS_DIR, ROOT, env, fake_deep_filter, fake_model, fake_nara_wpe, fake_wpe_calls, have_numpy, on_python_path,
-                     read_wav, reverb_fixture, run_cli, snr_db, srr_db, voice_noise_fixture, write_tone_wav, write_wav)
+from helpers import (OS_DIR, ROOT, crosstalk_fixture, energy_db, env, fake_deep_filter, fake_model, fake_nara_wpe, fake_wpe_calls,
+                     have_numpy, on_python_path, read_wav, read_wav_channels, reverb_fixture, run_cli, snr_db, srr_db,
+                     voice_noise_fixture, write_tone_wav, write_wav, write_wav_tracks)
 
 from voice_enhance_skill import SKILL_ID, __version__
 from voice_enhance_skill.contract import CAPABILITY_IDS, contract
 from voice_enhance_skill.doctor import doctor
 from voice_enhance_skill.engines import DEFAULT_ENGINE, engine_ids, engines_for, get_engine
-from voice_enhance_skill.engines import deepfilternet, nara_wpe_engine
+from voice_enhance_skill.engines import crosstalk, deepfilternet, nara_wpe_engine, wavio
 from voice_enhance_skill.engines.base import OPS, Engine, EngineRequest, EngineResult, parse_version
 from voice_enhance_skill.errors import ERROR_TABLE, EXIT_CODES, VoiceEnhanceError
 from voice_enhance_skill.ffmpeg_skill import FLAGS_USED, OPTIONAL_FLAGS, TOOLS_USED, FfmpegSkill, parse_contract
-from voice_enhance_skill.ops import (DereverbRequest, IsolateRequest, check_paths, dereverb, isolate, select_engine,
-                                     select_stream)
+from voice_enhance_skill.ops import (BleedReduceRequest, DereverbRequest, IsolateRequest, bleed_reduce, check_paths, dereverb,
+                                     isolate, select_engine, select_stream, track_name)
 from voice_enhance_skill.procs import TIMEOUT_EXIT, run_process_group
 from voice_enhance_skill.provenance import build_provenance, sha256_file
 from voice_enhance_skill.service import run_engine
@@ -38,6 +41,7 @@ from voice_enhance_skill.service import run_engine
 POSIX = os.name == "posix"
 NUMPY = have_numpy()
 NEEDS_NUMPY = "needs numpy: the fake nara_wpe computes on it (the integration job installs it)"
+NEEDS_NUMPY_BLEED = "needs numpy: the crosstalk engine computes on it (the integration job installs it)"
 NO_DEEP_FILTER = {"VOICE_ENHANCE_DEEP_FILTER": os.path.join(tempfile.gettempdir(), "no-such-deep-filter"),
                   "VOICE_ENHANCE_DFN_MODEL": None}
 
@@ -108,8 +112,8 @@ class ContractTests(unittest.TestCase):
         for p in c["provides"]:
             self.assertEqual(set(p), {"id", "lifecycle", "tool_id"})
             self.assertIn(p["tool_id"], tool_ids)
-            # ISOLATE (step 3, ADR-003) and DEREVERB (step 4, ADR-004) are implemented; BLEED_REDUCE is declared only
-            self.assertEqual(p["lifecycle"], "EXPERIMENTAL" if p["id"] in ("voice.isolate", "voice.dereverb") else "PROPOSED", p)
+            # ISOLATE (step 3, ADR-003), DEREVERB (step 4, ADR-004) and BLEED_REDUCE (step 5, ADR-005) are implemented
+            self.assertEqual(p["lifecycle"], "EXPERIMENTAL", p)
         for d in c["dependencies"]:
             self.assertIsInstance(d["version_range"], str)
             self.assertFalse(d["version_range"].replace(".", "").isdigit(), d)
@@ -137,9 +141,17 @@ class ContractTests(unittest.TestCase):
                          (f"{SKILL_ID}/isolate@1", 48000, 1))
         for flag in ("--audio-stream", "--atten-lim-db", "--timeout", "--overwrite", "--ffmpeg-skill", "--offline"):
             self.assertTrue(any(a.startswith("[" + flag) for a in tool["argv"]), flag)
-        for t in contract()["tools"]:
-            if t["tool_id"] == f"{SKILL_ID}/bleed-reduce":
-                self.assertFalse(t["implemented"])
+
+    def test_bleed_reduce_tool_entry(self):
+        tool = next(t for t in contract()["tools"] if t["tool_id"] == f"{SKILL_ID}/bleed-reduce")
+        self.assertTrue(tool["implemented"])
+        self.assertEqual((tool["schema"], tool["engine"], tool["roadmap_step"], tool["output"]["codec"], tool["output"]["channels"]),
+                         (f"{SKILL_ID}/bleed-reduce@1", "crosstalk", 5, "pcm_f32le", 1))
+        self.assertIn("outputs", tool["result_keys"])
+        for flag in ("--audio-streams", "--engine", "--dominance-db", "--timeout", "--overwrite", "--ffmpeg-skill", "--offline"):
+            self.assertTrue(any(a.startswith("[" + flag) for a in tool["argv"]), flag)
+        spec = contract()["engines"]["registered"]["crosstalk"]
+        self.assertEqual((spec["kind"], spec["weights_license"]), ("python", "none (signal processing, no weights)"))
 
     def test_dereverb_tool_entry(self):
         tool = next(t for t in contract()["tools"] if t["tool_id"] == f"{SKILL_ID}/dereverb")
@@ -171,11 +183,12 @@ class ContractTests(unittest.TestCase):
 
 class EngineRegistryTests(unittest.TestCase):
     def test_registry(self):
-        self.assertEqual(engine_ids(), ["deepfilternet", "nara_wpe"])
+        self.assertEqual(engine_ids(), ["crosstalk", "deepfilternet", "nara_wpe"])
         self.assertEqual(set(DEFAULT_ENGINE), set(OPS))
         self.assertEqual(engines_for("isolate"), ["deepfilternet"])
         self.assertEqual(engines_for("dereverb"), ["nara_wpe"])
-        self.assertEqual(engines_for("bleed_reduce"), [])      # ADR-001: no AI engine for cross-talk
+        self.assertEqual(engines_for("bleed_reduce"), ["crosstalk"])    # ADR-001: no AI engine; ADR-005: signal processing
+        self.assertEqual(DEFAULT_ENGINE["bleed_reduce"], "crosstalk")
         with self.assertRaises(VoiceEnhanceError) as e:
             get_engine("demucs")
         self.assertEqual(e.exception.code, "ENGINE_UNAVAILABLE")
@@ -297,7 +310,7 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual((e.exception.code, e.exception.details["exit_code"]), ("ENGINE_FAILED", 9))   # mode "fail" exits 9
 
     def test_an_engine_without_process_is_not_implemented(self):
-        class Declared(Engine):          # an engine declared before its op exists (BLEED_REDUCE until step 5)
+        class Declared(Engine):          # an engine declared before its op exists (as BLEED_REDUCE was until step 5)
             id, ops, roadmap_step = "declared", ("bleed_reduce",), 5
 
             def inspect(self):
@@ -424,9 +437,13 @@ class IsolatePlanningTests(unittest.TestCase):
         with self.assertRaises(VoiceEnhanceError) as e:
             select_engine("isolate", "demucs")
         self.assertEqual(e.exception.code, "ENGINE_UNAVAILABLE")
-        with self.assertRaises(VoiceEnhanceError) as e:
+        with mock.patch.object(crosstalk, "_found", return_value=False), self.assertRaises(VoiceEnhanceError) as e:
             select_engine("bleed_reduce", None)
-        self.assertEqual(e.exception.code, "ENGINE_UNAVAILABLE")
+        self.assertEqual((e.exception.code, e.exception.details["engine"]), ("ENGINE_UNAVAILABLE", "crosstalk"))
+        self.assertIn("[bleed]", e.exception.details["install"])
+        with self.assertRaises(VoiceEnhanceError) as e:
+            select_engine("bleed_reduce", "nara_wpe")
+        self.assertEqual(e.exception.code, "INVALID_ARGUMENT")
 
     @unittest.skipUnless(POSIX, "the fake deep-filter is a shell script")
     def test_engine_without_model_is_model_not_found(self):
@@ -813,6 +830,385 @@ class DereverbOpTests(unittest.TestCase):
         self.assertEqual((rc3, again["parameters"]["iterations"]), (0, 1))
 
 
+class ChannelStreamsStub(StubSkill):
+    """Like StubSkill, but every channel of a WAV is a separate mono audio stream, so one file can stand for a
+    recorder that wrote one stream per microphone. audio_to_wav --audio-stream k writes channel k."""
+
+    def probe(self, path):
+        facts = super().probe(path)
+        ch = facts["audio"]["channels"]
+        if os.path.basename(path).startswith("multi"):
+            a = dict(facts["audio"], channels=1)
+            facts.update(audio=a, audio_streams=[dict(a, index=k) for k in range(ch)])
+        return facts
+
+    def audio_to_wav(self, src, dst, audio_stream=None, mono=False, sample_rate=None, timeout=None):
+        if not os.path.basename(src).startswith("multi"):
+            return super().audio_to_wav(src, dst, audio_stream, mono, sample_rate, timeout)
+        self.calls.append({"src": os.path.basename(src), "audio_stream": audio_stream, "mono": mono, "sample_rate": sample_rate})
+        rate, channels = read_wav_channels(src)
+        write_wav(dst, channels[audio_stream or 0], rate, 1)
+        return {"status": "completed", "output": dst, "probe": self.probe(dst)}
+
+
+def write_mics(directory, fixture, names=("lav_a.wav", "lav_b.wav"), rates=None):
+    return [write_wav(os.path.join(directory, name), mic, (rates or {}).get(k, fixture["rate"]))
+            for k, (name, mic) in enumerate(zip(names, fixture["mics"]))]
+
+
+class CrosstalkEngineTests(unittest.TestCase):
+    """What the crosstalk engine accepts and reports, checked without NumPy."""
+
+    def test_statuses(self):
+        eng = get_engine("crosstalk")
+        with mock.patch.object(crosstalk, "_found", return_value=False):
+            r = eng.report()
+        self.assertEqual((r["status"], r["missing"]), ("MISSING", "package"))
+        self.assertIn("[bleed]", r["install"])
+        with mock.patch.object(crosstalk, "_found", return_value=True), mock.patch.object(crosstalk, "_numpy_version", return_value="1.26.4"):
+            r = eng.report()
+        self.assertEqual((r["status"], r["version"], r["install"], r["numpy"]), ("OK", __version__, None, "1.26.4"))
+        with mock.patch.object(crosstalk, "_found", return_value=True), mock.patch.object(crosstalk, "_numpy_version", return_value="1.19.5"):
+            self.assertEqual(eng.inspect()["status"], "INCOMPATIBLE")
+        self.assertEqual((eng.kind, eng.ops, eng.network_required), ("python", ("bleed_reduce",), False))
+
+    def test_params(self):
+        self.assertEqual(crosstalk.check_params({}), {"dominance_db": 3.0})
+        self.assertEqual(crosstalk.check_params({"dominance_db": 10, "timeout": 5.0}), {"dominance_db": 10.0})
+        for bad in ({"dominance_db": -1}, {"dominance_db": 31}, {"dominance_db": True}, {"dominance_db": "3"}):
+            with self.assertRaises(VoiceEnhanceError) as e:
+                crosstalk.check_params(bad)
+            self.assertEqual(e.exception.code, "INVALID_ARGUMENT", bad)
+
+    def test_track_count_is_checked_in_the_worker_too(self):
+        with mock.patch.object(crosstalk, "_found", return_value=True), mock.patch.object(crosstalk, "_numpy_version", return_value="1.26.4"):
+            for ins, outs in ((["a.wav"], ["b.wav"]), (["a.wav", "b.wav"], ["c.wav"])):
+                with self.assertRaises(VoiceEnhanceError) as e:
+                    get_engine("crosstalk").process(EngineRequest("bleed_reduce", ins[0], outs[0], input_paths=ins, output_paths=outs))
+                self.assertEqual(e.exception.code, "INVALID_ARGUMENT")
+
+    def test_request_carries_several_tracks(self):
+        req = EngineRequest("bleed_reduce", "a.wav", "x.wav", input_paths=["a.wav", "b.wav"], output_paths=["x.wav", "y.wav"])
+        self.assertEqual(EngineRequest.from_dict(json.loads(json.dumps(req.to_dict()))), req)
+        res = EngineResult("x.wav", "0.1.0", None, output_paths=["x.wav", "y.wav"])
+        self.assertEqual(EngineResult.from_dict(json.loads(json.dumps(res.to_dict()))), res)
+        self.assertEqual(EngineResult.from_dict({"output_path": "x", "engine_version": "1"}).output_paths, [])
+
+
+@unittest.skipUnless(NUMPY, NEEDS_NUMPY_BLEED)
+class CrosstalkProcessTests(unittest.TestCase):
+    """CrosstalkEngine.process through the real worker subprocess, and the signal-processing pieces it is made of."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_two_track_fixture_cross_talk_energy_falls(self):
+        fx = crosstalk_fixture(seconds=2.0, rate=16000)
+        srcs = write_mics(self.tmp, fx)
+        outs = [os.path.join(self.tmp, "out0.wav"), os.path.join(self.tmp, "out1.wav")]
+        res = run_engine("crosstalk", EngineRequest("bleed_reduce", srcs[0], outs[0], sample_rate=16000, input_paths=srcs,
+                                                    output_paths=outs), 120, self.tmp)
+        self.assertEqual((res.output_paths, res.engine_version, res.model), (outs, __version__, None))
+        x = res.extra
+        self.assertEqual((x["dominance_db"], x["output_format"], x["stft"]), (3.0, "pcm_f32le", {"window": "hann", "size": 1024, "hop": 256}))
+        for i, j in ((0, 1), (1, 0)):          # the measured coupling is the fixture's -8 dB leak
+            self.assertAlmostEqual(x["coupling_db"][i][j], -8.0, delta=1.5, msg=x["coupling_db"])
+            self.assertGreater(x["estimation_bins"][i][j], 0)
+        for k in (0, 1):
+            rate, ch, y = read_wav(outs[k])
+            self.assertEqual((rate, ch, len(y)), (16000, 1, len(fx["mics"][k])))
+            self.assertEqual(Path(outs[k]).read_bytes()[20:22], b"\x03\x00")          # WAVE_FORMAT_IEEE_FLOAT
+            x_in = read_wav(srcs[k])[2]
+            before, after = energy_db(x_in, rate, fx["other"][k]), energy_db(y, rate, fx["other"][k])
+            self.assertLess(after, before - 10.0, (k, before, after))                   # cross-talk energy falls by > 10 dB
+            own_before, own_after = energy_db(x_in, rate, fx["own"][k]), energy_db(y, rate, fx["own"][k])
+            self.assertAlmostEqual(own_after, own_before, delta=1.0, msg=(k, own_before, own_after))   # its own talker stays
+
+    def test_identity_round_trip_keeps_each_track_and_its_length(self):
+        """TrackReader -> STFT -> overlap-add -> TrackWriter with no processing gives every track back sample for sample,
+        across block borders, each at its own length (the shorter one is not padded)."""
+        import numpy as np
+        a = write_wav(os.path.join(self.tmp, "a.wav"), [math.sin(i / 7.0) * (i % 501) / 501 for i in range(9000)], 22050)
+        b = write_wav(os.path.join(self.tmp, "b.wav"), [((i * 7919) % 2000 - 1000) / 1500 for i in range(7000)], 22050)
+        outs = [os.path.join(self.tmp, "oa.wav"), os.path.join(self.tmp, "ob.wav")]
+        reader = wavio.TrackReader([a, b])
+        try:
+            size, hop = wavio.stft_sizes(22050, crosstalk.HOP_SECONDS)
+            writer = wavio.TrackWriter(outs, 22050, reader.lengths)
+            try:
+                wavio.stft_process(reader, writer, np, size, hop, 5, 0, lambda spec, skip: spec[skip:])
+            finally:
+                writer.close()
+        finally:
+            reader.close()
+        for src, out in zip((a, b), outs):
+            x, y = read_wav(src)[2], read_wav(out)[2]
+            self.assertEqual(len(y), len(x))
+            self.assertLess(max(abs(p - q) for p, q in zip(x, y)), 1e-6)
+
+    def test_track_reader_refuses_mixed_rates_and_stereo(self):
+        a = write_wav(os.path.join(self.tmp, "a.wav"), [0.1] * 100, 16000)
+        b = write_wav(os.path.join(self.tmp, "b.wav"), [0.1] * 100, 48000)
+        c = write_wav(os.path.join(self.tmp, "c.wav"), [0.1] * 100, 16000, channels=2)
+        for pair in ((a, b), (a, c)):
+            with self.assertRaises(VoiceEnhanceError):
+                wavio.TrackReader(pair)
+
+    def test_demixing_is_the_inverse_unless_badly_conditioned(self):
+        import numpy as np
+        h = np.zeros((2, 2, 2), dtype=complex)
+        h[0, 0, 1], h[0, 1, 0] = 0.3, 0.2 * np.exp(1j)            # bin 0: a moderate leak both ways
+        h[1, 0, 1] = h[1, 1, 0] = 0.98                             # bin 1: I + H is nearly singular
+        w, fallback = crosstalk.demixing_matrices(np, h)
+        self.assertEqual(fallback, 1)
+        self.assertLess(float(np.max(np.abs(w[0] @ (np.eye(2) + h[0]) - np.eye(2)))), 1e-12)
+        self.assertLess(float(np.max(np.abs(w[1] - (np.eye(2) - h[1])))), 1e-12)
+        num = np.ones((3, 2, 2), dtype=complex)
+        den = np.array([[[0, 2], [4, 0]], [[0, 0], [0, 0]], [[0, 1], [1, 0]]], dtype=float)
+        c = crosstalk.coupling(np, num, den)                     # no usable bins -> nothing is subtracted
+        self.assertEqual((c[0, 0, 1], c[0, 1, 0], c[1, 0, 1], c[0, 0, 0]), (0.5, 0.25, 0, 0))
+
+
+class BleedReducePlanningTests(unittest.TestCase):
+    """The checks BLEED_REDUCE makes before any media work. The engine is reported OK through mocked lookups, so these
+    run without NumPy; nothing here reaches the engine."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+        self.skill = StubSkill()
+        self.a = write_tone_wav(os.path.join(self.tmp, "a.wav"), 0.1)
+        self.b = write_tone_wav(os.path.join(self.tmp, "b.wav"), 0.1, freq=300.0)
+        self.out = os.path.join(self.tmp, "clean")
+        patches = (mock.patch.object(crosstalk, "_found", return_value=True), mock.patch.object(crosstalk, "_numpy_version", return_value="1.26.4"))
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def refused(self, code, req, skill=None):
+        with self.assertRaises(VoiceEnhanceError) as e:
+            bleed_reduce(req, skill=skill or self.skill)
+        self.assertEqual(e.exception.code, code, e.exception.message)
+        self.assertFalse(os.path.exists(self.out))
+        self.assertEqual([n for n in os.listdir(self.tmp) if n.startswith(".voice-enhance-")], [])
+        return e.exception
+
+    def test_numbers_and_paths(self):
+        a, b = self.a, self.b
+        for kw in ({"timeout": 0}, {"audio_streams": [-1, 0]}, {"audio_streams": []}, {"audio_streams": [0]}, {"dominance_db": 31},
+                   {"dominance_db": -0.5}):
+            self.refused("INVALID_ARGUMENT", BleedReduceRequest([a, b], self.out, **kw))
+        self.refused("INVALID_ARGUMENT", BleedReduceRequest([a] * 9, self.out))
+        self.refused("INPUT_NOT_FOUND", BleedReduceRequest([a, os.path.join(self.tmp, "nope.wav")], self.out))
+        self.refused("INVALID_ARGUMENT", BleedReduceRequest([a, b], os.path.join(self.tmp, "no-dir", "clean")))
+        self.refused("INVALID_ARGUMENT", BleedReduceRequest([a, b], a))                     # -o names a directory, not a file
+        self.assertEqual(self.skill.calls, [])
+
+    def test_tracks(self):
+        e = self.refused("INVALID_ARGUMENT", BleedReduceRequest([self.a], self.out))        # one file with one stream: one track
+        self.assertEqual(e.details["tracks"], 1)
+        self.refused("INVALID_ARGUMENT", BleedReduceRequest([self.a, self.a], self.out))    # the same stream twice
+        os.mkdir(os.path.join(self.tmp, "other"))
+        twin = write_tone_wav(os.path.join(self.tmp, "other", "a.wav"), 0.1)
+        e = self.refused("INVALID_ARGUMENT", BleedReduceRequest([self.a, twin], self.out))  # both would be a_a0.wav
+        self.assertEqual(e.details["names"], ["a_a0.wav", "a_a0.wav"])
+        self.refused("INVALID_ARGUMENT", BleedReduceRequest([self.a, self.b], self.out, audio_streams=[0, 1]))   # b has one stream
+        self.assertEqual(self.skill.calls, [])
+        self.assertEqual(track_name("/x/talk.take2.mkv", 3), "talk.take2_a3.wav")
+
+    def test_outputs(self):
+        os.mkdir(self.out)
+        Path(self.out, "a_a0.wav").write_bytes(b"old")
+        with self.assertRaises(VoiceEnhanceError) as e:
+            bleed_reduce(BleedReduceRequest([self.a, self.b], self.out), skill=self.skill)
+        self.assertEqual(e.exception.code, "OUTPUT_EXISTS")
+        self.assertEqual(Path(self.out, "a_a0.wav").read_bytes(), b"old")
+        self.assertEqual(self.skill.calls, [])
+
+    @unittest.skipUnless(POSIX, "uses a symlink")
+    def test_output_that_is_an_input_is_refused_even_with_overwrite(self):
+        os.mkdir(self.out)
+        target = write_tone_wav(os.path.join(self.out, "c_a0.wav"), 0.1)
+        link = os.path.join(self.tmp, "c.wav")              # its output would be clean/c_a0.wav: the file it points to
+        os.symlink(target, link)
+        with self.assertRaises(VoiceEnhanceError) as e:
+            bleed_reduce(BleedReduceRequest([link, self.b], self.out, overwrite=True), skill=self.skill)
+        self.assertEqual(e.exception.code, "OUTPUT_IS_INPUT")
+        self.assertEqual(self.skill.calls, [])
+
+    def test_different_rates_without_audio_sample_rate_are_refused_before_any_work(self):
+        c = write_tone_wav(os.path.join(self.tmp, "c.wav"), 0.1, rate=44100)
+        e = self.refused("FFMPEG_SKILL_UNAVAILABLE", BleedReduceRequest([self.a, c], self.out))
+        self.assertEqual((e.details["needs_flag"], e.details["sample_rates"], e.details["required_sample_rate"]),
+                         ("sample_rate", [48000, 44100], 48000))
+        self.assertEqual(self.skill.calls, [])
+
+    def test_missing_engine_is_refused_before_any_media_work(self):
+        with mock.patch.object(crosstalk, "_found", return_value=False):
+            e = self.refused("ENGINE_UNAVAILABLE", BleedReduceRequest([self.a, self.b], self.out))
+            rc, doc = run_cli("bleed-reduce", self.a, self.b, "-o", self.out, "--json")
+        self.assertIn("[bleed]", e.details["install"])
+        self.assertEqual((rc, doc["ok"], doc["error"]["code"]), (3, False, "ENGINE_UNAVAILABLE"))
+        self.assertEqual(self.skill.calls, [])
+
+    def test_cli_argument_errors_are_one_json_document(self):
+        rc, doc = run_cli("bleed-reduce", self.a, os.path.join(self.tmp, "nope.wav"), "-o", self.out, "--json")
+        self.assertEqual((rc, doc["error"]["code"]), (2, "INPUT_NOT_FOUND"))
+        rc, doc = run_cli("bleed-reduce", self.a, self.b, "-o", self.out, "--dominance-db", "40", "--json")
+        self.assertEqual((rc, doc["error"]["code"]), (2, "INVALID_ARGUMENT"))
+        rc, doc = run_cli("bleed-reduce", self.a, self.b, "-o", self.out, "--audio-streams", "0", "--json")
+        self.assertEqual((rc, doc["error"]["code"]), (2, "INVALID_ARGUMENT"))
+
+
+@unittest.skipUnless(NUMPY, NEEDS_NUMPY_BLEED)
+class BleedReduceOpTests(unittest.TestCase):
+    """BLEED_REDUCE end to end with the crosstalk engine in the worker and the stub ffmpeg-skill."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+        self.skill = StubSkill()
+        self.out = os.path.join(self.tmp, "clean")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def assert_no_leftovers(self):
+        for d in (self.tmp, self.out):
+            if os.path.isdir(d):
+                self.assertEqual([n for n in os.listdir(d) if n.startswith(".voice-enhance-")], [])
+
+    def assert_cross_talk_falls(self, fx, srcs, outs, channels_of=None):
+        for k, out in enumerate(outs):
+            rate, ch, y = read_wav(out)
+            x = fx["mics"][k]
+            self.assertEqual((rate, ch, len(y)), (fx["rate"], 1, len(x)))
+            before, after = energy_db(x, rate, fx["other"][k]), energy_db(y, rate, fx["other"][k])
+            self.assertLess(after, before - 10.0, (k, before, after))
+            self.assertAlmostEqual(energy_db(y, rate, fx["own"][k]), energy_db(x, rate, fx["own"][k]), delta=1.0)
+
+    def test_two_track_fixture_cross_talk_energy_falls(self):
+        fx = crosstalk_fixture(seconds=2.0, rate=16000)
+        srcs = write_mics(self.tmp, fx)
+        shas = [sha256_file(p) for p in srcs]
+        doc = bleed_reduce(BleedReduceRequest(srcs, self.out), skill=self.skill)
+        outs = [os.path.join(self.out, "lav_a_a0.wav"), os.path.join(self.out, "lav_b_a0.wav")]
+        self.assertEqual([sha256_file(p) for p in srcs], shas)                 # the inputs are never modified
+        self.assertEqual(sorted(os.listdir(self.out)), ["lav_a_a0.wav", "lav_b_a0.wav"])   # created whole, nothing else in it
+        self.assert_cross_talk_falls(fx, srcs, outs)
+        self.assertEqual((doc["schema"], doc["ok"], doc["op"], doc["capability"]),
+                         (f"{SKILL_ID}/bleed-reduce@1", True, "bleed_reduce", "voice.bleed_reduce"))
+        self.assertEqual(doc["output_dir"], os.path.abspath(self.out))
+        self.assertEqual([(o["track"], o["path"], o["sample_rate"], o["channels"]) for o in doc["outputs"]],
+                         [(0, outs[0], 16000, 1), (1, outs[1], 16000, 1)])
+        self.assertEqual([(i["track"], i["path"], i["audio_stream"]) for i in doc["inputs"]],
+                         [(0, os.path.abspath(srcs[0]), 0), (1, os.path.abspath(srcs[1]), 0)])
+        self.assertEqual(doc["engine"], {"id": "crosstalk", "version": __version__, "model": None})
+        p = doc["parameters"]
+        self.assertEqual((p["tracks"], p["audio_streams"], p["dominance_db"], p["sample_rate"], p["output_format"]),
+                         (2, [0, 0], 3.0, 16000, "pcm_f32le"))
+        self.assertAlmostEqual(p["coupling_db"][0][1], -8.0, delta=1.5)
+        self.assertEqual([(st["track"], st["flags"]) for st in doc["steps"]], [(0, ["--audio-stream", "0"]), (1, ["--audio-stream", "0"])])
+        prov = doc["provenance"]
+        self.assertEqual((prov["op"], prov["inputs"], prov["outputs"]),
+                         ("bleed_reduce", [{"sha256": s} for s in shas], [{"sha256": sha256_file(o)} for o in outs]))
+        self.assertNotIn("input", prov)
+        self.assertEqual((prov["engine"]["id"], prov["ffmpeg_skill"]["version"]), ("crosstalk", "2.22.4"))
+        self.assertEqual(doc["warnings"], [])
+        json.dumps(doc, allow_nan=False)
+        self.assert_no_leftovers()
+
+    def test_streams_of_one_file_and_stereo_fold_down(self):
+        """One recorder file with one stream per microphone: all its streams are the tracks. A stereo track is folded
+        down to mono in a second ffmpeg-skill pass, as for ISOLATE."""
+        fx = crosstalk_fixture(seconds=2.0, rate=16000)
+        self.skill = ChannelStreamsStub()
+        multi = write_wav_tracks(os.path.join(self.tmp, "multi.wav"), fx["mics"], 16000)
+        doc = bleed_reduce(BleedReduceRequest([multi], self.out), skill=self.skill)
+        self.assertEqual([o["path"] for o in doc["outputs"]], [os.path.join(self.out, "multi_a0.wav"), os.path.join(self.out, "multi_a1.wav")])
+        self.assertEqual([(i["audio_stream"], i["audio_stream_count"]) for i in doc["inputs"]], [(0, 2), (1, 2)])
+        self.assert_cross_talk_falls(fx, None, [o["path"] for o in doc["outputs"]])
+        shutil.rmtree(self.out)
+        stereo = write_wav(os.path.join(self.tmp, "stereo_b.wav"), fx["mics"][1], 16000, channels=2)
+        mono = write_wav(os.path.join(self.tmp, "mono_a.wav"), fx["mics"][0], 16000)
+        doc = bleed_reduce(BleedReduceRequest([mono, stereo], self.out), skill=StubSkill())
+        self.assertEqual([(st["track"], st["flags"]) for st in doc["steps"]],
+                         [(0, ["--audio-stream", "0"]), (1, ["--audio-stream", "0"]), (1, ["--mono"])])
+        self.assertIn("track 1: audio stream 0 has 2 channels; it was folded down to mono", doc["warnings"][0])
+        self.assert_cross_talk_falls(fx, None, [o["path"] for o in doc["outputs"]])
+
+    def test_audio_streams_picks_tracks(self):
+        fx = crosstalk_fixture(seconds=1.0, rate=16000)
+        self.skill = ChannelStreamsStub()
+        three = write_wav_tracks(os.path.join(self.tmp, "multi3.wav"), [fx["mics"][0], [0.0] * 100, fx["mics"][1]], 16000)
+        doc = bleed_reduce(BleedReduceRequest([three], self.out, audio_streams=[2, 0], dominance_db=6.0), skill=self.skill)
+        self.assertEqual([o["path"] for o in doc["outputs"]], [os.path.join(self.out, "multi3_a2.wav"), os.path.join(self.out, "multi3_a0.wav")])
+        self.assertEqual((doc["parameters"]["audio_streams"], doc["parameters"]["dominance_db"]), ([2, 0], 6.0))
+        self.assertEqual([c["audio_stream"] for c in self.skill.calls], [2, 0])
+
+    def test_existing_directory_and_overwrite(self):
+        fx = crosstalk_fixture(seconds=1.0, rate=16000)
+        srcs = write_mics(self.tmp, fx)
+        os.mkdir(self.out)
+        Path(self.out, "keep.txt").write_text("mine", encoding="utf-8")
+        bleed_reduce(BleedReduceRequest(srcs, self.out), skill=self.skill)
+        self.assertEqual(sorted(os.listdir(self.out)), ["keep.txt", "lav_a_a0.wav", "lav_b_a0.wav"])
+        with self.assertRaises(VoiceEnhanceError) as e:
+            bleed_reduce(BleedReduceRequest(srcs, self.out), skill=self.skill)
+        self.assertEqual(e.exception.code, "OUTPUT_EXISTS")
+        doc = bleed_reduce(BleedReduceRequest(srcs, self.out, overwrite=True), skill=self.skill)
+        self.assertTrue(doc["ok"])
+        self.assertEqual(Path(self.out, "keep.txt").read_text(encoding="utf-8"), "mine")
+        self.assert_no_leftovers()
+
+    def test_output_failing_validation_writes_nothing(self):
+        fx = crosstalk_fixture(seconds=1.0, rate=16000)
+        srcs = write_mics(self.tmp, fx)
+        real_probe = self.skill.probe
+        def probe(path):                     # ffmpeg-skill reads the second stem at the wrong rate
+            facts = real_probe(path)
+            if os.path.basename(path) == "lav_b_a0.wav" and ".voice-enhance-" in path:
+                facts["audio"] = dict(facts["audio"], sample_rate=8000)
+            return facts
+        self.skill.probe = probe
+        with self.assertRaises(VoiceEnhanceError) as e:
+            bleed_reduce(BleedReduceRequest(srcs, self.out), skill=self.skill)
+        self.assertEqual(e.exception.code, "INVALID_RESULT")
+        self.assertIn("sample rate 8000", e.exception.message)
+        self.assertFalse(os.path.exists(self.out))                          # not even the first, valid stem
+        self.assert_no_leftovers()
+
+    def test_warnings_for_unaligned_lengths_and_unmeasurable_pairs(self):
+        fx = crosstalk_fixture(seconds=1.0, rate=16000)
+        a = write_wav(os.path.join(self.tmp, "a.wav"), fx["mics"][0], 16000)
+        quiet = write_wav(os.path.join(self.tmp, "quiet.wav"), [0.0] * 12000, 16000)     # never louder than a, and shorter
+        doc = bleed_reduce(BleedReduceRequest([a, quiet], self.out), skill=self.skill)
+        self.assertTrue(any("differ in length" in w for w in doc["warnings"]), doc["warnings"])
+        self.assertTrue(any("track 1 was never louder than track 0" in w for w in doc["warnings"]), doc["warnings"])
+        self.assertIsNone(doc["parameters"]["coupling_db"][0][1])
+        self.assertEqual([o["duration"] for o in doc["outputs"]], [1.0, 0.75])                # each keeps its own length
+        x, y = read_wav(a)[2], read_wav(doc["outputs"][0]["path"])[2]
+        self.assertLess(max(abs(p - q) for p, q in zip(x, y)), 1e-4)                          # nothing removed from a
+
+    def test_cli_bleed_reduce_json(self):
+        fx = crosstalk_fixture(seconds=1.0, rate=16000)
+        srcs = write_mics(self.tmp, fx)
+        with mock.patch("voice_enhance_skill.ops.FfmpegSkill.locate", return_value=self.skill):
+            rc, doc = run_cli("bleed-reduce", *srcs, "-o", self.out, "--audio-streams", "0,0", "--dominance-db", "4", "--json")
+            rc2, err = run_cli("bleed-reduce", *srcs, "-o", self.out, "--json")
+            rc3, again = run_cli("bleed-reduce", *srcs, "-o", self.out, "--overwrite", "--json")
+        self.assertEqual((rc, doc["ok"], len(doc["outputs"]), doc["parameters"]["dominance_db"]), (0, True, 2, 4.0))
+        self.assertEqual((rc2, err["ok"], err["error"]["code"]), (EXIT_CODES["OUTPUT_EXISTS"], False, "OUTPUT_EXISTS"))
+        self.assertEqual((rc3, again["ok"]), (0, True))
+
+
 class FfmpegSkillContractTests(unittest.TestCase):
     def doc(self, drop=None):
         return fake_ffmpeg_contract(drop)
@@ -844,19 +1240,21 @@ class FfmpegSkillContractTests(unittest.TestCase):
 class DoctorTests(unittest.TestCase):
     def test_missing_engines_are_reported_missing(self):
         missing = os.path.join(tempfile.gettempdir(), "no-such-ffmpeg-skill")
-        with env(**NO_DEEP_FILTER), mock.patch.object(nara_wpe_engine, "_found", return_value=False):
+        with env(**NO_DEEP_FILTER), mock.patch.object(nara_wpe_engine, "_found", return_value=False), \
+                mock.patch.object(crosstalk, "_found", return_value=False):
             d = doctor(missing)
             rc, cli_doc = run_cli("doctor", "--ffmpeg-skill", missing, "--offline", "--json")
-        for eid in ("deepfilternet", "nara_wpe"):
+        for eid in ("crosstalk", "deepfilternet", "nara_wpe"):
             self.assertEqual(d["checks"]["engines"][eid]["status"], "MISSING")
             self.assertTrue(d["checks"]["engines"][eid]["install"])
-        self.assertEqual(d["unavailable_engines"], ["deepfilternet", "nara_wpe"])
+        self.assertEqual(d["unavailable_engines"], ["crosstalk", "deepfilternet", "nara_wpe"])
         self.assertEqual(d["checks"]["ffmpeg_skill"]["status"], "MISSING")
         self.assertEqual((d["status"], d["ok"]), ("fail", False))
         self.assertEqual(set(d["checks"]["operations"]), set(OPS))
         self.assertFalse(any(o["ready"] for o in d["checks"]["operations"].values()))
         self.assertEqual({op: o["implemented"] for op, o in d["checks"]["operations"].items()},
-                         {"isolate": True, "dereverb": True, "bleed_reduce": False})
+                         {"isolate": True, "dereverb": True, "bleed_reduce": True})
+        self.assertEqual(d["checks"]["operations"]["bleed_reduce"]["engine"], "crosstalk")
         self.assertEqual((rc, cli_doc["status"], cli_doc["offline"]), (1, "fail", True))
 
     def test_engines_command(self):
@@ -878,6 +1276,11 @@ class ProvenanceTests(unittest.TestCase):
             self.assertNotIn("path", p["engine"])
             self.assertFalse(p["network"])
             self.assertEqual(p["skill"], {"id": SKILL_ID, "version": __version__})
+            b = write_tone_wav(os.path.join(tmp, "b.wav"), 0.1, freq=300.0)
+            many = build_provenance(op="bleed_reduce", engine=report, input_path=[a, b], output_path=[b, a], parameters={})
+            self.assertEqual((many["inputs"], many["outputs"]), ([{"sha256": sha256_file(a)}, {"sha256": sha256_file(b)}],
+                                                                 [{"sha256": sha256_file(b)}, {"sha256": sha256_file(a)}]))
+            self.assertNotIn("input", many)
 
 
 @unittest.skipUnless(OS_DIR, "needs an AI-video-production-OS checkout (AI_VIDEO_PRODUCTION_OS_DIR or ../AI-video-production-OS)")

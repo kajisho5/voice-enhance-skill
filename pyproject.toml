@@ -16,6 +16,8 @@ dependencies = []
 [project.optional-dependencies]
 # DEREVERB engine (ADR-001). The ISOLATE engine is the external `deep-filter` binary, not a Python package.
 wpe = ["nara_wpe>=0.0.11,<0.1", "numpy>=1.21"]
+# BLEED_REDUCE engine (ADR-005): this repository's own signal processing on NumPy, no model weights.
+bleed = ["numpy>=1.21"]
 
 [project.scripts]
 voice-enhance = "voice_enhance_skill.cli:main"

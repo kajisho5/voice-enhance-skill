@@ -5,7 +5,7 @@ Written from a read-only audit of this repository on 2026-10-30. Each step below
 
 ## Where it stands
 
-Skeleton 0.1.0 ([#3](https://github.com/kajisho5/voice-enhance-skill/pull/3)): engines chosen (ADR-001), `contract` / `doctor` / `engines`, engine registry and worker. ISOLATE works ([#4](https://github.com/kajisho5/voice-enhance-skill/pull/4), ADR-003, `EXPERIMENTAL`). DEREVERB works ([#5](https://github.com/kajisho5/voice-enhance-skill/pull/5), ADR-004, `EXPERIMENTAL`). BLEED_REDUCE is not implemented yet.
+Skeleton 0.1.0 ([#3](https://github.com/kajisho5/voice-enhance-skill/pull/3)): engines chosen (ADR-001), `contract` / `doctor` / `engines`, engine registry and worker. ISOLATE works ([#4](https://github.com/kajisho5/voice-enhance-skill/pull/4), ADR-003, `EXPERIMENTAL`). DEREVERB works ([#5](https://github.com/kajisho5/voice-enhance-skill/pull/5), ADR-004, `EXPERIMENTAL`). BLEED_REDUCE works ([#6](https://github.com/kajisho5/voice-enhance-skill/pull/6), ADR-005, `EXPERIMENTAL`).
 
 ## What this repository owns
 
@@ -15,11 +15,11 @@ Skeleton 0.1.0 ([#3](https://github.com/kajisho5/voice-enhance-skill/pull/3)): e
 |---|---|---|
 | 声の分離(AI) | experimental | `voice-enhance isolate` ([#4](https://github.com/kajisho5/voice-enhance-skill/pull/4)); not yet measured with the real engine on Japanese speech |
 | 残響除去 | experimental | `voice-enhance dereverb` ([#5](https://github.com/kajisho5/voice-enhance-skill/pull/5)); not yet measured with the real engine on Japanese speech |
-| マイク被り低減 | missing |  |
+| マイク被り低減 | experimental | `voice-enhance bleed-reduce` ([#6](https://github.com/kajisho5/voice-enhance-skill/pull/6)); signal processing (`crosstalk`, no weights); not yet measured on a real multi-mic recording |
 
 ## Wiring
 
-ffmpeg-skill `probe` (input facts, stem validation) and `audio` (stream extraction, mono fold-down) are used by ISOLATE ([#4](https://github.com/kajisho5/voice-enhance-skill/pull/4)). DEREVERB ([#5](https://github.com/kajisho5/voice-enhance-skill/pull/5)) uses `probe` and a single `audio --audio-stream` pass (WPE takes any rate and layout, ADR-004). Still to come: `audio --replace` to put the cleaned stem back (step 6). Gaps to report to ffmpeg-skill: `audio --sample-rate` (inputs not at 48 kHz are refused until it exists), `audio --mono` reading the first audio stream's channel count instead of the one `--audio-stream` picks (ADR-003), and `.wav` output fixed at `pcm_s16le`, so 24-bit sources reach the engine at 16 bits (ADR-004, not blocking).
+ffmpeg-skill `probe` (input facts, stem validation) and `audio` (stream extraction, mono fold-down) are used by ISOLATE ([#4](https://github.com/kajisho5/voice-enhance-skill/pull/4)). DEREVERB ([#5](https://github.com/kajisho5/voice-enhance-skill/pull/5)) uses `probe` and a single `audio --audio-stream` pass (WPE takes any rate and layout, ADR-004). BLEED_REDUCE ([#6](https://github.com/kajisho5/voice-enhance-skill/pull/6)) prepares every track like ISOLATE at the first track's rate (ADR-005). Still to come: `audio --replace` to put the cleaned stem back (step 6). Gaps to report to ffmpeg-skill: `audio --sample-rate` (inputs not at 48 kHz are refused until it exists), `audio --mono` reading the first audio stream's channel count instead of the one `--audio-stream` picks (ADR-003), `.wav` output fixed at `pcm_s16le`, so 24-bit sources reach the engine at 16 bits (ADR-004, not blocking), and no way to pick one channel of a stream (`audio --channel N`), so two microphones sharing a stereo stream are folded into one BLEED_REDUCE track (ADR-005). BLEED_REDUCE with tracks at different rates also waits for `audio --sample-rate`.
 
 ## Steps
 
@@ -31,7 +31,7 @@ ffmpeg-skill `probe` (input facts, stem validation) and `audio` (stream extracti
   - Done when: SNR rises on a synthetic voice+noise fixture
 - [x] **4. DEREVERB op** ([#5](https://github.com/kajisho5/voice-enhance-skill/pull/5), ADR-004: `voice-enhance dereverb`, one ffmpeg-skill `audio --audio-stream` pass at the stream's own rate and channels, `nara_wpe.wpe.wpe_v8` in the worker on 30 s blocks with the engine's own STFT, 32-bit float output validated through `probe`. The signal-to-reverberation ratio rises by more than 6 dB on the synthetic reverberant fixture through a fake `nara_wpe` package, including on the stereo stream 1 of a two-stream video through the real ffmpeg-skill. The real-engine variant of the test runs only where nara_wpe is installed)
   - Done when: same pattern
-- [ ] **5. BLEED_REDUCE op** — multi-mic input
+- [x] **5. BLEED_REDUCE op** ([#6](https://github.com/kajisho5/voice-enhance-skill/pull/6), ADR-005: `voice-enhance bleed-reduce`, 2-8 time-aligned tracks from one file's audio streams or one stream per file, each prepared through ffmpeg-skill `audio` at the first track's rate. The `crosstalk` engine (this repository's signal processing on NumPy, no weights; ADR-001 found no AI engine) estimates a dominance-gated least-squares coupling per frequency and demixes per bin with `(I + H)^-1` in the worker. Every stem is validated through `probe` before any is placed. On the synthetic two-microphone fixture (-8 dB leak, 4 ms), cross-talk energy falls by more than 10 dB with each track's own speech within 1 dB, through the stub ffmpeg-skill and through the real one on the two audio streams of a video) — multi-mic input
   - Done when: lower cross-talk energy on a 2-track fixture
 - [ ] **6. Remux helper** — via ffmpeg-skill audio --replace
   - Done when: video stream byte-identical

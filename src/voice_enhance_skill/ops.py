@@ -1,6 +1,6 @@
-"""The ops. ISOLATE (roadmap step 3, ADR-003) and DEREVERB (step 4, ADR-004) are implemented; BLEED_REDUCE arrives in
-step 5 and will reuse the same frame: checked paths, an engine that is OK, the input prepared through ffmpeg-skill, the
-engine in the worker subprocess, the result validated through ffmpeg-skill, then moved into place.
+"""The ops: ISOLATE (roadmap step 3, ADR-003), DEREVERB (step 4, ADR-004) and BLEED_REDUCE (step 5, ADR-005). All three
+use the same frame: checked paths, an engine that is OK, the input prepared through ffmpeg-skill, the engine in the
+worker subprocess, the result validated through ffmpeg-skill, then moved into place.
 
 ISOLATE, step by step:
   1. paths      the input is a regular file; the output is a .wav that is not the input and does not exist (unless
@@ -18,6 +18,12 @@ ISOLATE, step by step:
 DEREVERB is the same frame with two differences (ADR-004): WPE works at any sample rate and on any number of channels,
 so step 4 is a single ffmpeg-skill/audio --audio-stream N pass (no fold-down, no resampling, so no audio --sample-rate
 is needed), and step 6 checks the stem against the prepared input's own rate and channel count.
+
+BLEED_REDUCE is the same frame over several tracks at once (ADR-005): two or more audio streams (of one file, or one
+per file), each prepared like ISOLATE's input but at the first track's sample rate (mono fold-down in a second pass;
+a different rate only with audio --sample-rate, else FFMPEG_SKILL_UNAVAILABLE before any work). The crosstalk engine
+runs once on all of them and writes one float WAV per track. Every stem is validated through ffmpeg-skill/probe
+before any is placed; into a new output directory they move with one rename of the whole directory.
 """
 from __future__ import annotations
 
@@ -30,6 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import SKILL_ID, __version__
 from .engines import DEFAULT_ENGINE, engines_for, get_engine
 from .engines.base import OK, Engine, EngineRequest
+from .engines.crosstalk import LIMITS as CROSSTALK_LIMITS, MAX_TRACKS, MIN_TRACKS
 from .engines.nara_wpe_engine import LIMITS as WPE_LIMITS
 from .errors import VoiceEnhanceError
 from .ffmpeg_skill import FfmpegSkill
@@ -38,6 +45,7 @@ from .service import DEFAULT_TIMEOUT, run_engine
 
 ISOLATE_SCHEMA = f"{SKILL_ID}/isolate@1"
 DEREVERB_SCHEMA = f"{SKILL_ID}/dereverb@1"
+BLEED_REDUCE_SCHEMA = f"{SKILL_ID}/bleed-reduce@1"
 ISOLATE_RATE = 48000                 # deep-filter accepts 48 kHz WAV only (ADR-001)
 DURATION_TOLERANCE = 0.1             # seconds, or 1 % of the duration when that is larger
 PREPARED_NAME = "input.wav"
@@ -67,6 +75,19 @@ class DereverbRequest:
     taps: Optional[int] = None
     delay: Optional[int] = None
     iterations: Optional[int] = None
+    ffmpeg_skill_dir: Optional[str] = None
+    offline: bool = False
+
+
+@dataclass
+class BleedReduceRequest:
+    input_paths: List[str]
+    output_dir: str
+    audio_streams: Optional[List[int]] = None
+    engine: Optional[str] = None
+    timeout: float = DEFAULT_TIMEOUT
+    overwrite: bool = False
+    dominance_db: Optional[float] = None
     ffmpeg_skill_dir: Optional[str] = None
     offline: bool = False
 
@@ -238,10 +259,10 @@ def _usable_skill(skill: Optional[FfmpegSkill], directory: Optional[str], timeou
     return skill, info
 
 
-def _run_dir(dst: str, output_path: str) -> str:
-    """A private run directory in the output's own directory, so the result is placed with one rename."""
+def _run_dir(directory: str, output_path: str) -> str:
+    """A private run directory in `directory` (the output's own directory), so the result is placed with one rename."""
     try:
-        return tempfile.mkdtemp(prefix=".voice-enhance-", dir=os.path.dirname(dst))
+        return tempfile.mkdtemp(prefix=".voice-enhance-", dir=directory)
     except OSError as e:
         raise VoiceEnhanceError("INVALID_ARGUMENT", f"cannot write to the output directory: {e}", {"output": output_path})
 
@@ -267,7 +288,7 @@ def isolate(req: IsolateRequest, skill: Optional[FfmpegSkill] = None) -> Dict[st
     skill, info = _usable_skill(skill, req.ffmpeg_skill_dir, float(req.timeout))
     facts = skill.probe(src)
     stream, stream_count = select_stream(facts, req.audio_stream, os.path.basename(src))
-    run_dir = _run_dir(dst, req.output_path)
+    run_dir = _run_dir(os.path.dirname(dst), req.output_path)
     try:
         prepared, prepared_facts, steps, warnings = prepare_wav(skill, src, run_dir, req.audio_stream, ISOLATE_RATE, stream)
         params: Dict[str, Any] = {"timeout": float(req.timeout)}
@@ -321,7 +342,7 @@ def dereverb(req: DereverbRequest, skill: Optional[FfmpegSkill] = None) -> Dict[
     skill, info = _usable_skill(skill, req.ffmpeg_skill_dir, float(req.timeout))
     facts = skill.probe(src)
     stream, stream_count = select_stream(facts, req.audio_stream, os.path.basename(src))
-    run_dir = _run_dir(dst, req.output_path)
+    run_dir = _run_dir(os.path.dirname(dst), req.output_path)
     try:
         prepared = os.path.join(run_dir, PREPARED_NAME)
         prepared_facts, step = extract_stream(skill, src, prepared, req.audio_stream)
@@ -358,4 +379,188 @@ def dereverb(req: DereverbRequest, skill: Optional[FfmpegSkill] = None) -> Dict[
         "steps": [step],
         "provenance": provenance,
         "warnings": [],
+    }
+
+
+def _check_bleed(req: BleedReduceRequest) -> None:
+    if not isinstance(req.timeout, (int, float)) or req.timeout <= 0:
+        raise VoiceEnhanceError("INVALID_ARGUMENT", "--timeout must be > 0", {"timeout": req.timeout})
+    if not req.input_paths or len(req.input_paths) > MAX_TRACKS:
+        raise VoiceEnhanceError("INVALID_ARGUMENT", f"give 1 to {MAX_TRACKS} inputs", {"inputs": len(req.input_paths or [])})
+    streams = req.audio_streams
+    if streams is not None and (not streams or any(isinstance(s, bool) or not isinstance(s, int) or s < 0 for s in streams)):
+        raise VoiceEnhanceError("INVALID_ARGUMENT", "--audio-streams must be integers >= 0", {"audio_streams": streams})
+    if streams is not None and len(req.input_paths) > 1 and len(streams) != len(req.input_paths):
+        raise VoiceEnhanceError("INVALID_ARGUMENT", f"with {len(req.input_paths)} inputs, --audio-streams needs one stream per input "
+                                f"(got {len(streams)})", {"audio_streams": streams, "inputs": len(req.input_paths)})
+    lo, hi = CROSSTALK_LIMITS["dominance_db"]
+    d = req.dominance_db
+    if d is not None and (isinstance(d, bool) or not isinstance(d, (int, float)) or not lo <= float(d) <= hi):
+        raise VoiceEnhanceError("INVALID_ARGUMENT", f"--dominance-db must be a number from {lo:g} to {hi:g}", {"dominance_db": d})
+
+
+def _check_bleed_paths(req: BleedReduceRequest) -> Tuple[List[str], str]:
+    """(absolute inputs, absolute output directory). The directory either exists or is created on success inside an
+    existing parent; nothing is written here."""
+    srcs = []
+    for p in req.input_paths:
+        if not os.path.isfile(p):
+            raise VoiceEnhanceError("INPUT_NOT_FOUND", f"{p} is not a file", {"input": p})
+        srcs.append(os.path.abspath(p))
+    out_dir = os.path.abspath(req.output_dir)
+    if os.path.lexists(out_dir) and not os.path.isdir(out_dir):
+        raise VoiceEnhanceError("INVALID_ARGUMENT", f"{req.output_dir} exists and is not a directory (-o names a directory: one WAV "
+                                "per track is written into it)", {"output_dir": req.output_dir})
+    if not os.path.isdir(os.path.dirname(out_dir)):
+        raise VoiceEnhanceError("INVALID_ARGUMENT", f"the parent directory of {req.output_dir} does not exist", {"output_dir": req.output_dir})
+    return srcs, out_dir
+
+
+def track_name(src: str, audio_stream: int) -> str:
+    """The output file name of one track: <input name without extension>_a<stream>.wav."""
+    return f"{os.path.splitext(os.path.basename(src))[0]}_a{audio_stream}.wav"
+
+
+def _plan_tracks(skill: FfmpegSkill, srcs: List[str], wanted: Optional[List[int]]) -> List[Dict[str, Any]]:
+    """One entry per track: the input, its probe, the chosen stream and its facts. One input without --audio-streams
+    means all of its audio streams."""
+    facts = {src: skill.probe(src) for src in dict.fromkeys(srcs)}
+    if len(srcs) == 1:
+        streams = wanted if wanted is not None else list(range(len(audio_streams(facts[srcs[0]]))))
+        pairs = [(srcs[0], s) for s in streams]
+    else:
+        pairs = list(zip(srcs, wanted if wanted is not None else [0] * len(srcs)))
+    if not MIN_TRACKS <= len(pairs) <= MAX_TRACKS:
+        raise VoiceEnhanceError("INVALID_ARGUMENT", f"bleed reduction needs {MIN_TRACKS} to {MAX_TRACKS} tracks (one per microphone); "
+                                f"got {len(pairs)}. Give several files, or one file with several audio streams",
+                                {"tracks": len(pairs)})
+    if len(set(pairs)) != len(pairs):
+        raise VoiceEnhanceError("INVALID_ARGUMENT", "the same audio stream of the same file is given twice",
+                                {"tracks": [[os.path.basename(a), s] for a, s in pairs]})
+    tracks = []
+    for k, (src, s) in enumerate(pairs):
+        stream, count = select_stream(facts[src], s, os.path.basename(src))
+        tracks.append({"track": k, "src": src, "audio_stream": s, "facts": facts[src], "stream": stream, "stream_count": count,
+                       "name": track_name(src, s)})
+    names = [t["name"] for t in tracks]
+    if len(set(names)) != len(names):
+        raise VoiceEnhanceError("INVALID_ARGUMENT", f"two tracks would be written to the same file name: {names}; rename an input",
+                                {"names": names})
+    return tracks
+
+
+def _check_outputs(tracks: List[Dict[str, Any]], srcs: List[str], out_dir: str, overwrite: bool) -> List[str]:
+    dsts = [os.path.join(out_dir, t["name"]) for t in tracks]
+    for dst in dsts:
+        for src in srcs:
+            if os.path.realpath(dst) == os.path.realpath(src) or (os.path.exists(dst) and os.path.samefile(dst, src)):
+                raise VoiceEnhanceError("OUTPUT_IS_INPUT", f"{dst} is an input; the input is never modified", {"output": dst})
+        if os.path.isdir(dst):
+            raise VoiceEnhanceError("INVALID_ARGUMENT", f"{dst} is a directory", {"output": dst})
+        if os.path.lexists(dst) and not overwrite:
+            raise VoiceEnhanceError("OUTPUT_EXISTS", f"{dst} exists; pass --overwrite to replace it", {"output": dst})
+    return dsts
+
+
+def _check_rates(skill: FfmpegSkill, tracks: List[Dict[str, Any]]) -> int:
+    """The common sample rate (the first track's). Another rate is converted only through audio --sample-rate."""
+    rate = int(tracks[0]["stream"].get("sample_rate") or 0)
+    other = [t for t in tracks if int(t["stream"].get("sample_rate") or 0) != rate]
+    if other and not skill.info().takes_flag("audio", "sample_rate"):
+        raise VoiceEnhanceError("FFMPEG_SKILL_UNAVAILABLE", f"the tracks have different sample rates ({rate} Hz for track 0, "
+                                + ", ".join(f"{t['stream'].get('sample_rate')} Hz for track {t['track']}" for t in other)
+                                + "); bleed reduction needs one rate and this ffmpeg-skill checkout has no audio --sample-rate to "
+                                f"convert them. Convert every track to {rate} Hz first, or use an ffmpeg-skill release that declares "
+                                "audio --sample-rate", {"tool": "ffmpeg-skill/audio", "needs_flag": "sample_rate",
+                                                        "sample_rates": [t["stream"].get("sample_rate") for t in tracks],
+                                                        "required_sample_rate": rate})
+    return rate
+
+
+def _place_all(stems: List[str], dsts: List[str], stem_dir: str, out_dir: str, overwrite: bool) -> None:
+    """Every stem is already validated. A new output directory is the stem directory renamed whole; into an existing
+    one each stem is renamed in turn, after a last check that none of the names appeared meanwhile."""
+    if not os.path.lexists(out_dir):
+        os.rename(stem_dir, out_dir)
+        return
+    for dst in dsts:
+        if os.path.lexists(dst) and not overwrite:
+            raise VoiceEnhanceError("OUTPUT_EXISTS", f"{dst} appeared while the engine ran; pass --overwrite to replace it", {"output": dst})
+    for stem, dst in zip(stems, dsts):
+        os.replace(stem, dst)
+
+
+def bleed_reduce(req: BleedReduceRequest, skill: Optional[FfmpegSkill] = None) -> Dict[str, Any]:
+    """BLEED_REDUCE: two or more time-aligned microphone tracks (audio streams of one file, or one stream per file)
+    with the other microphones' cross-talk reduced, one mono 32-bit float WAV per track in `req.output_dir`, each with
+    its own length and sample-aligned with its input. `skill` is the ffmpeg-skill handle (located when None)."""
+    _check_bleed(req)
+    srcs, out_dir = _check_bleed_paths(req)
+    engine, report = select_engine("bleed_reduce", req.engine, req.offline)
+    skill, info = _usable_skill(skill, req.ffmpeg_skill_dir, float(req.timeout))
+    tracks = _plan_tracks(skill, srcs, req.audio_streams)
+    dsts = _check_outputs(tracks, srcs, out_dir, req.overwrite)
+    rate = _check_rates(skill, tracks)
+    # In the output directory, or next to it when it does not exist yet, so every stem is placed by a rename.
+    run_dir = _run_dir(out_dir if os.path.isdir(out_dir) else os.path.dirname(out_dir), req.output_dir)
+    try:
+        steps: List[Dict[str, Any]] = []
+        warnings: List[str] = []
+        prepared, durations = [], []
+        for t in tracks:
+            track_dir = os.path.join(run_dir, f"track{t['track']}")
+            os.mkdir(track_dir)
+            path, pfacts, tsteps, twarn = prepare_wav(skill, t["src"], track_dir, t["audio_stream"], rate, t["stream"])
+            prepared.append(path)
+            durations.append(float(pfacts.get("duration") or 0.0))
+            steps += [dict(st, track=t["track"]) for st in tsteps]
+            warnings += [f"track {t['track']}: {w}" for w in twarn]
+        if max(durations) - min(durations) > max(DURATION_TOLERANCE, 0.01 * max(durations)):
+            warnings.append(f"the tracks differ in length ({min(durations):.3f}s to {max(durations):.3f}s); bleed reduction assumes "
+                            "time-aligned tracks (one clock, one start). Align separately recorded tracks first (ffmpeg-skill sync)")
+        stem_dir = os.path.join(run_dir, "out")
+        os.mkdir(stem_dir)
+        stems = [os.path.join(stem_dir, t["name"]) for t in tracks]
+        params: Dict[str, Any] = {"timeout": float(req.timeout)}
+        if req.dominance_db is not None:
+            params["dominance_db"] = float(req.dominance_db)
+        result = run_engine(engine.id, EngineRequest(op="bleed_reduce", input_path=prepared[0], output_path=stems[0], sample_rate=rate,
+                                                     params=params, input_paths=prepared, output_paths=stems),
+                            float(req.timeout), run_dir)
+        if result.output_paths != stems:
+            raise VoiceEnhanceError("INVALID_RESULT", f"engine {engine.id!r} returned {len(result.output_paths)} output paths for "
+                                    f"{len(stems)} tracks", {"engine": engine.id})
+        out_facts = [validate_output(skill, stem, rate, d, engine.id) for stem, d in zip(stems, durations)]
+        x = result.extra
+        coupling = x.get("coupling_db") or []
+        for i, row in enumerate(coupling):
+            for j, value in enumerate(row):
+                if i != j and value is None:
+                    warnings.append(f"track {j} was never louder than track {i} by {x.get('dominance_db')} dB, so no bleed of "
+                                    f"track {j} could be measured in track {i}; nothing of it was removed")
+        engine_doc = dict(report, version=result.engine_version, model=result.model, model_sha256=None)
+        parameters = {"tracks": len(tracks), "audio_streams": [t["audio_stream"] for t in tracks],
+                      "dominance_db": x.get("dominance_db"), "method": x.get("method"), "stft": x.get("stft"),
+                      "block_seconds": x.get("block_seconds"), "coupling_db": coupling, "first_order_bins": x.get("first_order_bins"),
+                      "sample_rate": rate, "channels": 1, "output_format": x.get("output_format")}
+        provenance = build_provenance(op="bleed_reduce", engine=engine_doc, input_path=list(dict.fromkeys(srcs)), output_path=stems,
+                                      parameters=parameters, ffmpeg_skill=info.to_dict())
+        _place_all(stems, dsts, stem_dir, out_dir, req.overwrite)
+    finally:
+        shutil.rmtree(run_dir, ignore_errors=True)
+    return {
+        "schema": BLEED_REDUCE_SCHEMA,
+        "ok": True,
+        "op": "bleed_reduce",
+        "capability": "voice.bleed_reduce",
+        "skill": {"id": SKILL_ID, "version": __version__},
+        "output_dir": out_dir,
+        "outputs": [dict(_output_doc(dst, f), track=t["track"]) for t, dst, f in zip(tracks, dsts, out_facts)],
+        "inputs": [dict(_input_doc(t["src"], t["facts"], t["audio_stream"], t["stream_count"], t["stream"]), track=t["track"])
+                   for t in tracks],
+        "engine": {k: engine_doc.get(k) for k in ("id", "version", "model")},
+        "parameters": parameters,
+        "steps": steps,
+        "provenance": provenance,
+        "warnings": warnings,
     }

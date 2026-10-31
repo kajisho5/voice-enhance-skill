@@ -1,6 +1,7 @@
 """Integration with a real ffmpeg-skill checkout and a real FFmpeg: locate it, check every tool and flag this skill
-emits against its live contract, run its doctor, probe a WAV through it, and run ISOLATE and DEREVERB end to end on a
-video with two audio streams (fake deep-filter, fake nara_wpe on NumPy; the real engines only when installed). Skipped without a checkout
+emits against its live contract, run its doctor, probe a WAV through it, and run ISOLATE, DEREVERB and BLEED_REDUCE end
+to end on a video with two audio streams (fake deep-filter, fake nara_wpe on NumPy, the crosstalk engine on NumPy; the
+real ISOLATE / DEREVERB engines only when installed). Skipped without a checkout
 (VOICE_ENHANCE_FFMPEG_SKILL_DIR or ../ffmpeg-skill); CI's integration job always has one. FFmpeg is called directly
 here only to build the fixtures; the skill itself never does."""
 from __future__ import annotations
@@ -11,14 +12,15 @@ import subprocess
 import tempfile
 import unittest
 
-from helpers import (FFMPEG_SKILL_DIR, env, fake_deep_filter, fake_model, fake_nara_wpe, fake_wpe_calls, have_numpy, on_python_path,
-                     read_wav, reverb_fixture, run_cli, snr_db, srr_db, voice_noise_fixture, write_tone_wav)
+from helpers import (FFMPEG_SKILL_DIR, crosstalk_fixture, energy_db, env, fake_deep_filter, fake_model, fake_nara_wpe, fake_wpe_calls,
+                     have_numpy, on_python_path, read_wav, reverb_fixture, run_cli, snr_db, srr_db, voice_noise_fixture, write_tone_wav,
+                     write_wav)
 
 from voice_enhance_skill.doctor import doctor
 from voice_enhance_skill.engines import get_engine
 from voice_enhance_skill.errors import VoiceEnhanceError
 from voice_enhance_skill.ffmpeg_skill import TOOLS_USED, FfmpegSkill
-from voice_enhance_skill.ops import DereverbRequest, IsolateRequest, dereverb, isolate
+from voice_enhance_skill.ops import BleedReduceRequest, DereverbRequest, IsolateRequest, bleed_reduce, dereverb, isolate
 
 HAVE_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 NO_DEEP_FILTER = {"VOICE_ENHANCE_DEEP_FILTER": os.path.join(tempfile.gettempdir(), "no-such-deep-filter")}
@@ -206,6 +208,79 @@ class DereverbIntegrationTests(unittest.TestCase):
         doc = dereverb(DereverbRequest(src, out), skill=self.skill)
         self.assertEqual(doc["engine"]["id"], "nara_wpe")
         self.assertGreater(srr_db(dry, read_wav(out)[2]), srr_db(dry, read_wav(src)[2]))
+
+
+def mic_video(directory: str, wavs: list) -> str:
+    """A small video (FFV1) whose audio streams are the given WAVs in order (PCM, so the fixture is not altered)."""
+    out = os.path.join(directory, "panel.mkv")
+    argv = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "color=c=gray:s=64x64:r=25:d=2"]
+    for w in wavs:
+        argv += ["-i", w]
+    argv += ["-map", "0:v"] + [x for k in range(len(wavs)) for x in ("-map", f"{k + 1}:a")]
+    subprocess.run(argv + ["-c:v", "ffv1", "-c:a", "pcm_s16le", "-shortest", out], check=True, stdin=subprocess.DEVNULL)
+    return out
+
+
+@unittest.skipUnless(FFMPEG_SKILL_DIR and HAVE_FFMPEG, "needs an ffmpeg-skill checkout and ffmpeg/ffprobe on PATH")
+class BleedReduceIntegrationTests(unittest.TestCase):
+    """BLEED_REDUCE through the real ffmpeg-skill (probe, audio) and the crosstalk engine in the real worker."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+        self.skill = FfmpegSkill.locate(str(FFMPEG_SKILL_DIR))
+        self.out = os.path.join(self.tmp, "clean")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def assert_cross_talk_falls(self, fx, outs):
+        for k, out in enumerate(outs):
+            rate, ch, y = read_wav(out)
+            x = fx["mics"][k]
+            self.assertEqual((rate, ch), (fx["rate"], 1))
+            self.assertAlmostEqual(len(y), len(x), delta=fx["rate"] // 100)
+            before, after = energy_db(x, rate, fx["other"][k]), energy_db(y, rate, fx["other"][k])
+            self.assertLess(after, before - 10.0, (k, before, after))
+            self.assertAlmostEqual(energy_db(y, rate, fx["own"][k]), energy_db(x, rate, fx["own"][k]), delta=1.0)
+
+    @unittest.skipUnless(have_numpy(), "needs numpy: the crosstalk engine computes on it")
+    def test_two_mic_streams_of_a_video_cross_talk_falls(self):
+        fx = crosstalk_fixture(seconds=2.0, rate=48000)
+        wavs = [write_wav(os.path.join(self.tmp, f"mic{k}.wav"), m, 48000) for k, m in enumerate(fx["mics"])]
+        video = mic_video(self.tmp, wavs)
+        doc = bleed_reduce(BleedReduceRequest([video], self.out), skill=self.skill)
+        outs = [o["path"] for o in doc["outputs"]]
+        self.assertEqual(outs, [os.path.join(self.out, "panel_a0.wav"), os.path.join(self.out, "panel_a1.wav")])
+        self.assertEqual([(i["has_video"], i["audio_stream"], i["audio_stream_count"]) for i in doc["inputs"]], [(True, 0, 2), (True, 1, 2)])
+        self.assertEqual([(st["track"], st["flags"]) for st in doc["steps"]], [(0, ["--audio-stream", "0"]), (1, ["--audio-stream", "1"])])
+        self.assertEqual([o["codec"] for o in doc["outputs"]], ["pcm_f32le", "pcm_f32le"])
+        self.assert_cross_talk_falls(fx, outs)
+        self.assertEqual(doc["provenance"]["ffmpeg_skill"]["version"], self.skill.info().version)
+
+    @unittest.skipUnless(have_numpy(), "needs numpy: the crosstalk engine computes on it")
+    def test_cli_two_files_with_a_stereo_track(self):
+        fx = crosstalk_fixture(seconds=1.5, rate=48000)
+        a = write_wav(os.path.join(self.tmp, "lav_a.wav"), fx["mics"][0], 48000)
+        b = write_wav(os.path.join(self.tmp, "lav_b.wav"), fx["mics"][1], 48000, channels=2)
+        rc, doc = run_cli("bleed-reduce", a, b, "-o", self.out, "--ffmpeg-skill", str(FFMPEG_SKILL_DIR), "--json")
+        self.assertEqual((rc, doc["ok"]), (0, True), doc)
+        self.assertEqual([(st["track"], st["flags"]) for st in doc["steps"]],
+                         [(0, ["--audio-stream", "0"]), (1, ["--audio-stream", "0"]), (1, ["--mono"])])
+        self.assert_cross_talk_falls(fx, [o["path"] for o in doc["outputs"]])
+
+    @unittest.skipUnless(have_numpy(), "needs numpy: the crosstalk engine is checked before the rates")
+    def test_different_sample_rates(self):
+        a = write_tone_wav(os.path.join(self.tmp, "a.wav"), seconds=0.5, rate=48000)
+        b = write_tone_wav(os.path.join(self.tmp, "b.wav"), seconds=0.5, rate=44100, freq=300.0)
+        if self.skill.info().takes_flag("audio", "sample_rate"):
+            doc = bleed_reduce(BleedReduceRequest([a, b], self.out), skill=self.skill)
+            self.assertEqual(doc["steps"][-1]["flags"], ["--sample-rate", "48000"])
+        else:
+            with self.assertRaises(VoiceEnhanceError) as e:
+                bleed_reduce(BleedReduceRequest([a, b], self.out), skill=self.skill)
+            self.assertEqual((e.exception.code, e.exception.details["sample_rates"]), ("FFMPEG_SKILL_UNAVAILABLE", [48000, 44100]))
+            self.assertFalse(os.path.exists(self.out))
 
 
 if __name__ == "__main__":

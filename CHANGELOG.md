@@ -2,6 +2,14 @@
 
 ## 0.1.0 - unreleased
 
+BLEED_REDUCE op (roadmap step 5).
+
+- ADR-005: `voice-enhance bleed-reduce <media>... -o <out_dir>` reduces microphone cross-talk in 2-8 time-aligned tracks: the audio streams of one file, or one stream per file (`--audio-streams`). It writes one mono 32-bit float WAV per track, `<input name>_a<stream>.wav`, each with its own length and sample-aligned with its input. Optional `--engine`, `--dominance-db` (default 3), `--timeout`, `--overwrite`, `--ffmpeg-skill`, `--offline`. Result schema `voice-enhance/bleed-reduce@1` with per-track `outputs`, `inputs` and `steps`, and the measured `coupling_db` matrix. `voice.bleed_reduce` is `EXPERIMENTAL`.
+- New engine `crosstalk`, this repository's own signal processing on NumPy (`pip install 'voice-enhance-skill[bleed]'`), with no model and no weights. It runs in the worker. It estimates a least-squares coupling per frequency, only from bins where the other track dominates, then demixes per bin with `(I + H)^-1`. That is linear: nothing is gated or generated.
+- Tracks are prepared through ffmpeg-skill `audio` like ISOLATE's input (fold-down in a second pass) at the first track's rate. Mixed rates need `audio --sample-rate` and are refused with `FFMPEG_SKILL_UNAVAILABLE` before any work without it. Every stem is validated through ffmpeg-skill/probe before any is placed, and a new output directory is renamed into place whole.
+- The WAV I/O, STFT and overlap-add move to `engines/wavio.py`, shared by DEREVERB and BLEED_REDUCE. `EngineRequest` / `EngineResult` carry several paths, and provenance lists `inputs` / `outputs` for several files.
+- Tests: on a synthetic two-microphone fixture (-8 dB leak, 4 ms), cross-talk energy falls by more than 10 dB (about 17-20 dB measured) while each track's own speech stays within 1 dB, through the stub and through the real ffmpeg-skill (two audio streams of a video).
+
 DEREVERB op (roadmap step 4).
 
 - ADR-004: `voice-enhance dereverb <media> -o <out.wav>` removes late reverberation from one audio stream with WPE (`nara_wpe.wpe.wpe_v8`, statistics mode `full`) in the worker. The result keeps the stream's own sample rate and channels (multi-channel WPE), is written as 32-bit float WAV and is sample-aligned with the input. Optional `--audio-stream`, `--taps`, `--delay`, `--iterations` (nara_wpe's defaults 10 / 3 / 3), `--timeout`, `--overwrite`, `--ffmpeg-skill`, `--offline`. Result schema `voice-enhance/dereverb@1`. `voice.dereverb` is `EXPERIMENTAL`.

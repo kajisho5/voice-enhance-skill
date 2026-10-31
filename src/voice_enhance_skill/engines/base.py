@@ -17,11 +17,15 @@ OPS = ("isolate", "dereverb", "bleed_reduce")
 
 @dataclass
 class EngineRequest:
+    """One prepared WAV in, one cleaned WAV out. BLEED_REDUCE works on several tracks at once: it also fills
+    input_paths / output_paths (one output per track), and input_path / output_path name the first pair (ADR-005)."""
     op: str
     input_path: str
     output_path: str
     sample_rate: int = 48000
     params: Dict[str, Any] = field(default_factory=dict)
+    input_paths: List[str] = field(default_factory=list)
+    output_paths: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -37,6 +41,7 @@ class EngineResult:
     engine_version: str
     model: Optional[str]
     extra: Dict[str, Any] = field(default_factory=dict)
+    output_paths: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -44,7 +49,8 @@ class EngineResult:
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "EngineResult":
         return cls(output_path=str(d["output_path"]), engine_version=str(d["engine_version"]),
-                   model=None if d.get("model") is None else str(d["model"]), extra=dict(d.get("extra") or {}))
+                   model=None if d.get("model") is None else str(d["model"]), extra=dict(d.get("extra") or {}),
+                   output_paths=[str(p) for p in d.get("output_paths") or []])
 
 
 def parse_version(text: Optional[str]) -> Optional[Tuple[int, ...]]:
