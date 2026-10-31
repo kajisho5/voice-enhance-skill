@@ -668,7 +668,6 @@ class NaraWpeParamTests(unittest.TestCase):
 
 
 @unittest.skipUnless(NUMPY, NEEDS_NUMPY)
-@unittest.skipUnless(have_numpy(), NEEDS_NUMPY)
 class IndependentChannelsTests(unittest.TestCase):
     """nara_wpe_engine.independent_basis (ADR-007): which channel directions WPE runs on."""
 
@@ -696,6 +695,7 @@ class IndependentChannelsTests(unittest.TestCase):
         self.assertEqual(nara_wpe_engine.independent_basis(np, np.zeros((5, 2, 10), dtype=complex)).shape, (2, 0))
 
 
+@unittest.skipUnless(NUMPY, NEEDS_NUMPY)
 class NaraWpeProcessTests(unittest.TestCase):
     """NaraWpeEngine.process through the real worker subprocess, with the fake nara_wpe package."""
 

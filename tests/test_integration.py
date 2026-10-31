@@ -31,8 +31,8 @@ NO_DEEP_FILTER = {"VOICE_ENHANCE_DEEP_FILTER": os.path.join(tempfile.gettempdir(
 POSIX = os.name == "posix"
 NO_REAL_DEEP_FILTER = "deep-filter and DeepFilterNet3_onnx.tar.gz are not installed (only CI's engines job installs them, ADR-007)"
 # What the real engines must at least gain on the synthetic fixtures (ADR-007 records what CI measured).
-REAL_ISOLATE_MIN_GAIN_DB = 0.0
-REAL_DEREVERB_MIN_GAIN_DB = 0.0
+REAL_ISOLATE_MIN_GAIN_DB = 6.0       # measured +18.2 dB at 0 dB input SNR
+REAL_DEREVERB_MIN_GAIN_DB = 6.0      # measured +13 to +20 dB
 
 
 def real_engine_ok() -> bool:

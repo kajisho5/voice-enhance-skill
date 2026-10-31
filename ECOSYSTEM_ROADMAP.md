@@ -5,7 +5,7 @@ Written from a read-only audit of this repository on 2026-10-30. Each step below
 
 ## Where it stands
 
-Skeleton 0.1.0 ([#3](https://github.com/kajisho5/voice-enhance-skill/pull/3)): engines chosen (ADR-001), `contract` / `doctor` / `engines`, engine registry and worker. ISOLATE works ([#4](https://github.com/kajisho5/voice-enhance-skill/pull/4), ADR-003, `EXPERIMENTAL`). DEREVERB works ([#5](https://github.com/kajisho5/voice-enhance-skill/pull/5), ADR-004, `EXPERIMENTAL`). BLEED_REDUCE works ([#6](https://github.com/kajisho5/voice-enhance-skill/pull/6), ADR-005, `EXPERIMENTAL`). The remux helper puts a stem back into its video ([#7](https://github.com/kajisho5/voice-enhance-skill/pull/7), ADR-006).
+Skeleton 0.1.0 ([#3](https://github.com/kajisho5/voice-enhance-skill/pull/3)): engines chosen (ADR-001), `contract` / `doctor` / `engines`, engine registry and worker. ISOLATE works ([#4](https://github.com/kajisho5/voice-enhance-skill/pull/4), ADR-003, `EXPERIMENTAL`). DEREVERB works ([#5](https://github.com/kajisho5/voice-enhance-skill/pull/5), ADR-004, `EXPERIMENTAL`). BLEED_REDUCE works ([#6](https://github.com/kajisho5/voice-enhance-skill/pull/6), ADR-005, `EXPERIMENTAL`). The remux helper puts a stem back into its video ([#7](https://github.com/kajisho5/voice-enhance-skill/pull/7), ADR-006). SKILL.md and CI with the real engines on Linux ([#8](https://github.com/kajisho5/voice-enhance-skill/pull/8), ADR-007).
 
 ## What this repository owns
 
@@ -13,8 +13,8 @@ Skeleton 0.1.0 ([#3](https://github.com/kajisho5/voice-enhance-skill/pull/3)): e
 
 | Owned job | Status | Note |
 |---|---|---|
-| 声の分離(AI) | experimental | `voice-enhance isolate` ([#4](https://github.com/kajisho5/voice-enhance-skill/pull/4)); not yet measured with the real engine on Japanese speech |
-| 残響除去 | experimental | `voice-enhance dereverb` ([#5](https://github.com/kajisho5/voice-enhance-skill/pull/5)); not yet measured with the real engine on Japanese speech |
+| 声の分離(AI) | experimental | `voice-enhance isolate` ([#4](https://github.com/kajisho5/voice-enhance-skill/pull/4)); measured with the real engine in CI on synthetic fixtures only ([#8](https://github.com/kajisho5/voice-enhance-skill/pull/8)); not yet on Japanese speech |
+| 残響除去 | experimental | `voice-enhance dereverb` ([#5](https://github.com/kajisho5/voice-enhance-skill/pull/5)); measured with the real engine in CI on synthetic fixtures only ([#8](https://github.com/kajisho5/voice-enhance-skill/pull/8)); not yet on Japanese speech |
 | マイク被り低減 | experimental | `voice-enhance bleed-reduce` ([#6](https://github.com/kajisho5/voice-enhance-skill/pull/6)); signal processing (`crosstalk`, no weights); not yet measured on a real multi-mic recording |
 
 ## Wiring
@@ -35,7 +35,7 @@ ffmpeg-skill `probe` (input facts, stem validation) and `audio` (stream extracti
   - Done when: lower cross-talk energy on a 2-track fixture
 - [x] **6. Remux helper** ([#7](https://github.com/kajisho5/voice-enhance-skill/pull/7), ADR-006: `voice-enhance remux <video> <stem> -o <out>`, one ffmpeg-skill `audio --replace` call into a private run directory, same container, video stream copied, the stem as the only audio stream padded or trimmed to the video. Refused before any media is written where `--replace` would lose a stream: a second video stream (`FFMPEG_SKILL_UNAVAILABLE`), other audio streams unless `--drop-other-audio`. The output is checked through `probe` (one video and one audio stream; codec, profile, size, pixel format, frame rate, frame count and length of the video unchanged) before it is renamed into place. The video packets (pts and MD5) are equal in input and output through the real ffmpeg-skill on a Matroska / FFV1 file (ISOLATE's stem of stream 1) and on an MP4 / MPEG-4 file) — via ffmpeg-skill audio --replace
   - Done when: video stream byte-identical
-- [ ] **7. SKILL.md, CI (3 OSes unit, Linux engine job)**
+- [x] **7. SKILL.md, CI (3 OSes unit, Linux engine job)** ([#8](https://github.com/kajisho5/voice-enhance-skill/pull/8), ADR-007: `SKILL.md` checked against the code by unit tests; the unit job on Linux, macOS and Windows × Python 3.9 / 3.12; a Linux `engines` job with the real `deep-filter` 0.5.6 + DeepFilterNet3 (pinned SHA-256) and nara_wpe 0.0.11, where every real-engine test must run and pass. Measured: ISOLATE SNR 0 → 18.2 dB, DEREVERB SRR -0.8 → 19.0 dB. The `deep-filter` flags were as assumed; the real `wpe_v8` diverged on dual mono, fixed by running WPE on the independent channel components)
   - Done when: CI green
 - [ ] **8. (agent side) adapter + SkillSpec**
   - Done when: tracked in video-production-agent

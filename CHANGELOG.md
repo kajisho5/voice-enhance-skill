@@ -2,6 +2,13 @@
 
 ## 0.1.0 - unreleased
 
+SKILL.md and CI with the real engines (roadmap step 7).
+
+- ADR-007: `SKILL.md` for agents (commands with examples, when to use which op, `EXPERIMENTAL`, the 48 kHz rule of `isolate`, engine install lines, every error code with its exit code), held to the code by unit tests.
+- CI: a Linux `engines` job installs `deep-filter` 0.5.6 and `DeepFilterNet3_onnx.tar.gz` (pinned SHA-256, no PyTorch) and nara_wpe, and runs the whole suite with the real-engine tests required to run and pass. It measures both engines on the synthetic fixtures (ISOLATE SNR 0 → 18.2 dB; DEREVERB SRR -0.8 → 19.0 dB at 48 kHz).
+- The `deep-filter` flags of ADR-003 (`-D`, `-m`, `-o`, `--atten-lim-db`) are confirmed on the real 0.5.6 binary, and the stem is confirmed sample-aligned (it ends 1440 samples early). The install hint now points to the model tarball in the repository's `models/` directory, which is not a release asset.
+- DEREVERB: the real `wpe_v8` diverged on dual mono (SRR -0.8 → -48.4 dB). The engine now runs WPE on the independent components of the channels (eigenvectors of the channel covariance above -60 dB) and passes the rest through, so dual mono gets the mono result on both channels. New `parameters.independent_channels` and a warning when it is below the channel count.
+
 Remux helper (roadmap step 6).
 
 - ADR-006: `voice-enhance remux <video> <stem> -o <out>` puts a stem back into its video through one ffmpeg-skill `audio --replace` call. The video stream is copied packet for packet, and the stem becomes the only audio stream (AAC for `.mp4` / `.mov` / `.mkv`), padded with silence or trimmed to the video's length. The output keeps the input's container. Optional `--drop-other-audio`, `--timeout`, `--overwrite`, `--ffmpeg-skill`, `--offline`. Result schema `voice-enhance/remux@1`. It is a helper tool in the contract (`voice-enhance/remux`, no engine), not a capability, and `doctor` reports it under `checks.helpers`.
