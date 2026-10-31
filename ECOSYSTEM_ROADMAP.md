@@ -39,7 +39,7 @@ ffmpeg-skill `probe` (input facts, stem validation) and `audio` (stream extracti
   - Done when: CI green
 - [x] **8. (agent side) adapter + SkillSpec** — done in video-production-agent [#88](https://github.com/kajisho5/video-production-agent/pull/88) (ADR-073)
   - Done when: tracked in video-production-agent
-- [x] **9. ffmpeg-skill 3.0.0** — its contract_version 2.0 read without a warning; CI integration also against 3.0.0 ([#PRNUM](https://github.com/kajisho5/voice-enhance-skill/pull/PRNUM), ADR-008)
+- [x] **9. ffmpeg-skill 3.0.0** — its contract_version 2.0 read without a warning; CI integration also against 3.0.0 ([#11](https://github.com/kajisho5/voice-enhance-skill/pull/11), ADR-008)
 
 ---
 Engine for every media operation: [ffmpeg-skill](https://github.com/kajisho5/ffmpeg-skill) (42 tools, treated as complete). Orchestrator: [video-production-agent](https://github.com/kajisho5/video-production-agent).
