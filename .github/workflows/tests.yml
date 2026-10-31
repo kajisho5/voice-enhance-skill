@@ -34,7 +34,7 @@ jobs:
 
   integration:
     # Real FFmpeg from apt, plus read-only checkouts of ffmpeg-skill main (the live contract and probe) and
-    # AI-video-production-OS (registry conformance checks). No engine and no weights are installed (ADR-001), so
+    # Velisa, the OS (registry conformance checks). No engine and no weights are installed (ADR-001), so
     # nothing may skip here. NumPy is installed because the fake nara_wpe of the DEREVERB tests computes on it
     # (ADR-004), and so does the crosstalk engine of BLEED_REDUCE (ADR-005); nara_wpe itself is not.
     runs-on: ubuntu-24.04
@@ -46,7 +46,7 @@ jobs:
           path: vendor/ffmpeg-skill
       - uses: actions/checkout@v4
         with:
-          repository: kajisho5/AI-video-production-OS
+          repository: kajisho5/Velisa
           path: vendor/AI-video-production-OS
       - uses: actions/setup-python@v5
         with:
@@ -84,7 +84,7 @@ jobs:
           path: vendor/ffmpeg-skill
       - uses: actions/checkout@v4
         with:
-          repository: kajisho5/AI-video-production-OS
+          repository: kajisho5/Velisa
           path: vendor/AI-video-production-OS
       - uses: actions/setup-python@v5
         with:
