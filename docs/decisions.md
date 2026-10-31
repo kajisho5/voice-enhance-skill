@@ -253,3 +253,23 @@ Roadmap step 7: SKILL.md, and CI with a unit job on three OSes and a Linux engin
 - Letting `deep-filter` resample non-48 kHz input itself, instead of waiting for ffmpeg-skill `audio --sample-rate`.
 - A per-frequency rank check, if real recordings show channels that are dependent in one band only (mono bass under a stereo pair).
 - Engines on macOS and Windows in CI, if a platform-specific failure ever shows up; the release has binaries for both.
+
+## ADR-008 ffmpeg-skill 3.0.0: its contract_version 2.0 is known; CI also runs against 3.0.0
+
+**Context.** ffmpeg-skill 3.0.0 (`1dc2f52`) declares `contract_version` 2.0; 0.x–2.x declared 1.0. Against it,
+`doctor` warned "contract_version 2.0 differs from 1.0". 3.0 also drops Python 3.9 and FFmpeg 5.x and changes
+`cut.py`'s defaults. The 2.0 bump is for `cut.py`'s `precision` / `keyframe_snapped` meaning (ffmpeg-skill
+`docs/contract.md` "What 3.0 changed"). This skill calls only `probe` and `audio`, and none of `FLAGS_USED` /
+`OPTIONAL_FLAGS` changed.
+
+**Decision.** `KNOWN_CONTRACT_VERSIONS = ("1.0", "2.0")`. Only a value outside those majors is a warning. The number
+is still reported and never gated on. The contract's `dependencies[0].contract_version` stays the oldest (1.0), and
+its `version_range` is capability detection either way, so the published contract does not change.
+
+**Python / FFmpeg / CI.** No job combined ffmpeg-skill with Python 3.9. The unit jobs (3.9 / 3.12) never run
+ffmpeg-skill. The integration and engines jobs run Python 3.12 on ubuntu-24.04 (apt FFmpeg 6.1), both inside 3.0's
+floors. The integration job becomes a matrix over ffmpeg-skill main and 3.0.0 (pinned by commit). Python 3.9 stays
+supported by this skill.
+
+**Verified.** The full suite passes against 3.0.0 locally (Python 3.11, FFmpeg 6.1.1). Against 3.0.0, `doctor`
+reports `ffmpeg_skill` OK with no warning.

@@ -2,6 +2,10 @@
 
 ## 0.1.0 - unreleased
 
+ffmpeg-skill 3.0.0 (ADR-008).
+
+- ffmpeg-skill 3.x declares `contract_version` 2.0; it is read like 1.0, with no warning. Only `probe` and `audio` are used, and nothing they take changed. The CI integration job also runs against 3.0.0, pinned by commit. Python 3.9 stays supported here: the unit jobs never run ffmpeg-skill, and its integration jobs run Python 3.12.
+
 SKILL.md and CI with the real engines (roadmap step 7).
 
 - ADR-007: `SKILL.md` for agents (commands with examples, when to use which op, `EXPERIMENTAL`, the 48 kHz rule of `isolate`, engine install lines, every error code with its exit code), held to the code by unit tests.
