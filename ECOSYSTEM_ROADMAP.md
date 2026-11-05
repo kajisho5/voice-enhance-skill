@@ -40,6 +40,12 @@ ffmpeg-skill `probe` (input facts, stem validation) and `audio` (stream extracti
 - [x] **8. (agent side) adapter + SkillSpec** — done in video-production-agent [#88](https://github.com/kajisho5/video-production-agent/pull/88) (ADR-073)
   - Done when: tracked in video-production-agent
 - [x] **9. ffmpeg-skill 3.0.0** — its contract_version 2.0 read without a warning; CI integration also against 3.0.0 ([#11](https://github.com/kajisho5/voice-enhance-skill/pull/11), ADR-008)
+- [ ] **10. Measured on real Japanese venue recordings** — a consented test set (lecture hall with reverberation, lapel mic, handheld mic with PA bleed, panel with three mics) and a report per op: SNR / SRR / cross-talk change and transcription-skill WER before and after, so `EXPERIMENTAL` can be lifted per op with evidence. Field review 2026-11-05 (Velisa ROADMAP, third round)
+  - なぜ要るか：学会会場の実際の音でどれだけ効くかが分からないと、現場で使う判断ができない
+  - Done when: a report committed for each op on at least 10 minutes per condition, with the WER change
+- [ ] **11. Long files in blocks, resumable** — 2-8 h inputs processed in overlapping blocks with a crossfade at each seam, each block cached by its input hash, and a run that stops resumes at the first missing block; the realtime factor per engine is in the result
+  - なぜ要るか：終日の収録でも途中で落ちてやり直しにならず、終わるまでの時間が読める
+  - Done when: a 1 h fixture interrupted halfway resumes, and its output equals an uninterrupted run within -90 dB
 
 ---
 Engine for every media operation: [ffmpeg-skill](https://github.com/kajisho5/ffmpeg-skill) (3.x, 42 tools, contract_version 2.0; treated as complete, proposals go to Velisa's ROADMAP). Orchestrator: [video-production-agent](https://github.com/kajisho5/video-production-agent).
