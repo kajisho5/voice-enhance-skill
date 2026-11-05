@@ -23,7 +23,7 @@ ffmpeg-skill `probe` (input facts, stem validation) and `audio` (stream extracti
 
 ## Steps
 
-- [x] **1. Engine selection ADR** ([#3](https://github.com/kajisho5/voice-enhance-skill/pull/3), [docs/decisions.md](docs/decisions.md) ADR-001: DeepFilterNet3 `deep-filter` for ISOLATE, nara_wpe for DEREVERB, no AI engine for BLEED_REDUCE; the `ecosystem.json` engines value is written in the ADR and **pending** in AI-video-production-OS) — candidates to verify: DeepFilterNet, Demucs/HTDemucs, Resemble-Enhance, VoiceFixer, nara_wpe -- licence of code AND weights, CPU feasibility, Japanese speech
+- [x] **1. Engine selection ADR** ([#3](https://github.com/kajisho5/voice-enhance-skill/pull/3), [docs/decisions.md](docs/decisions.md) ADR-001: DeepFilterNet3 `deep-filter` for ISOLATE, nara_wpe for DEREVERB, no AI engine for BLEED_REDUCE; the `ecosystem.json` engines value is written in the ADR and now filled in Velisa's `ecosystem.json`) — candidates to verify: DeepFilterNet, Demucs/HTDemucs, Resemble-Enhance, VoiceFixer, nara_wpe -- licence of code AND weights, CPU feasibility, Japanese speech
   - Done when: ADR merged; ecosystem.json engines filled
 - [x] **2. Package skeleton + contract/doctor** ([#3](https://github.com/kajisho5/voice-enhance-skill/pull/3), ADR-002: publishes_contract, lifecycle_declared, dependency_version_ranges, no_unsafe_shell_out and doctor_status PASS in `tests/`; doctor reports both engines `MISSING` when absent) — modelled on transcription-skill (engine registry, worker subprocess, --offline)
   - Done when: OS static checks PASS; doctor reports a missing engine as MISSING
@@ -42,4 +42,4 @@ ffmpeg-skill `probe` (input facts, stem validation) and `audio` (stream extracti
 - [x] **9. ffmpeg-skill 3.0.0** — its contract_version 2.0 read without a warning; CI integration also against 3.0.0 ([#11](https://github.com/kajisho5/voice-enhance-skill/pull/11), ADR-008)
 
 ---
-Engine for every media operation: [ffmpeg-skill](https://github.com/kajisho5/ffmpeg-skill) (42 tools, treated as complete). Orchestrator: [video-production-agent](https://github.com/kajisho5/video-production-agent).
+Engine for every media operation: [ffmpeg-skill](https://github.com/kajisho5/ffmpeg-skill) (3.x, 42 tools, contract_version 2.0; treated as complete, proposals go to Velisa's ROADMAP). Orchestrator: [video-production-agent](https://github.com/kajisho5/video-production-agent).
