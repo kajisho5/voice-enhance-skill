@@ -17,10 +17,13 @@ Run `voice-enhance <command> ... --json` (installed by `pip install -e .`, Pytho
 | Same, one mic per file | `voice-enhance bleed-reduce lav_a.wav lav_b.wav -o clean/ --json` (add `--audio-streams 0,2` to pick streams, `--dominance-db 6` to be stricter) |
 | The stem back under the picture | `voice-enhance remux talk.mp4 talk_voice.wav -o talk_clean.mp4 --json` (video stream copied, the stem the only audio) |
 | Same, the input has several audio streams | add `--drop-other-audio` |
+| A long recording (hours), resumable | the same `isolate` / `dereverb` / `bleed-reduce` command; after a stop, run it again unchanged (add `--block-seconds 300` for shorter blocks, `--cache-dir DIR` to keep blocks elsewhere) |
 | What is installed | `voice-enhance doctor --json`, `voice-enhance engines --json` |
 | What this skill declares | `voice-enhance contract --json` (alias `skill --json`) |
 
 Every op takes `--overwrite` (an existing output is refused without it), `--timeout S` (default 3600; the engine's whole process group is killed), `--ffmpeg-skill DIR` and `--offline`. The input is never modified, and an output appears whole or not at all.
+
+**Long inputs.** `isolate`, `dereverb` and `bleed-reduce` process an input longer than `--block-seconds` (default 600, 15-3600) in blocks that overlap by 4 s and are crossfaded at each seam. Each finished block is cached in `.voice-enhance-blocks` next to the output (or `--cache-dir`), keyed by its input samples, the engine and its settings. If a run stops (failure, timeout, kill), run the same command again: it reuses the finished blocks and resumes at the first missing one (`blocks.resumed_from`). The cache is emptied when the run succeeds; it needs about as much free space as the output. `--timeout` applies to each block. `timing.realtime_factor` is the engine's seconds per second of audio: multiply it by the length to tell the user how long a recording will take. In blocks, `bleed-reduce` measures the coupling per block (`parameters.coupling_db` is their mean).
 
 ## When to use it
 

@@ -1,6 +1,8 @@
 """voice-enhance CLI.
 
 stdout: with --json exactly one JSON document, on success and failure alike. stderr: diagnostics only.
+Inputs longer than --block-seconds (default 600) are processed in overlapping blocks that are cached, so a stopped run
+resumes at the first missing block (ADR-009).
 Exit code: 0 on success; doctor exits 1 when its status is `fail`; an error exits errors.EXIT_CODES[code].
 
   voice-enhance contract --json     the contract (alias: skill --json)
@@ -8,16 +10,18 @@ Exit code: 0 on success; doctor exits 1 when its status is `fail`; an error exit
   voice-enhance engines --json      registered engines with status and licences [--offline]
   voice-enhance isolate <media> -o <out.wav> --json
                                     voice stem of one audio stream, 48 kHz mono WAV (ADR-003) [--audio-stream N]
-                                    [--engine deepfilternet] [--atten-lim-db N] [--timeout S] [--overwrite]
+                                    [--engine deepfilternet] [--atten-lim-db N] [--block-seconds S] [--cache-dir DIR]
+                                    [--timeout S] [--overwrite]
                                     [--ffmpeg-skill DIR] [--offline]
   voice-enhance dereverb <media> -o <out.wav> --json
                                     one audio stream with late reverberation removed (WPE), same rate and channels,
                                     32-bit float WAV (ADR-004) [--audio-stream N] [--engine nara_wpe] [--taps N]
-                                    [--delay N] [--iterations N] [--timeout S] [--overwrite] [--ffmpeg-skill DIR] [--offline]
+                                    [--delay N] [--iterations N] [--block-seconds S] [--cache-dir DIR] [--timeout S]
+                                    [--overwrite] [--ffmpeg-skill DIR] [--offline]
   voice-enhance bleed-reduce <media>... -o <out_dir> --json
                                     microphone tracks with the other mics' cross-talk reduced, one mono 32-bit float WAV
                                     per track (ADR-005) [--audio-streams 0,1] [--engine crosstalk] [--dominance-db N]
-                                    [--timeout S] [--overwrite] [--ffmpeg-skill DIR] [--offline]
+                                    [--block-seconds S] [--cache-dir DIR] [--timeout S] [--overwrite] [--ffmpeg-skill DIR] [--offline]
   voice-enhance remux <video> <stem> -o <out> --json
                                     the stem back into the video through ffmpeg-skill/audio --replace: video stream
                                     copied, the stem as the only audio stream, same container (ADR-006)
@@ -35,6 +39,7 @@ from .doctor import doctor, engines_report
 from .errors import VoiceEnhanceError
 from .engines.crosstalk import DEFAULTS as CROSSTALK_DEFAULTS, LIMITS as CROSSTALK_LIMITS, MAX_TRACKS
 from .engines.nara_wpe_engine import DEFAULTS as WPE_DEFAULTS, LIMITS as WPE_LIMITS
+from .blocks import BLOCK_LIMITS, BLOCK_SECONDS, CACHE_NAME, OVERLAP_SECONDS
 from .ops import BleedReduceRequest, DereverbRequest, IsolateRequest, RemuxRequest, bleed_reduce, dereverb, isolate, remux
 from .service import DEFAULT_TIMEOUT
 
@@ -60,7 +65,8 @@ def build_parser() -> argparse.ArgumentParser:
     i.add_argument("--audio-stream", type=int, default=0, help="which audio stream, 0-based in file order (default 0)")
     i.add_argument("--engine", help="engine id (default: deepfilternet)")
     i.add_argument("--atten-lim-db", type=float, help="limit the noise attenuation to N dB, 0 < N <= 100 (default: no limit)")
-    i.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help=f"engine time limit in seconds (default {DEFAULT_TIMEOUT:g})")
+    _block_args(i)
+    i.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help=f"engine time limit in seconds, per block (default {DEFAULT_TIMEOUT:g})")
     i.add_argument("--overwrite", action="store_true", help="allow replacing an existing output")
     i.add_argument("--ffmpeg-skill", help="ffmpeg-skill checkout directory")
     i.add_argument("--offline", action="store_true", help="no network (every registered engine already needs none)")
@@ -75,7 +81,8 @@ def build_parser() -> argparse.ArgumentParser:
                       "starts (direct sound and early reflections are kept)"), ("iterations", "WPE iterations")):
         lo, hi = WPE_LIMITS[key]
         r.add_argument(f"--{key}", type=int, help=f"{what}, {lo}-{hi} (default {WPE_DEFAULTS[key]})")
-    r.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help=f"engine time limit in seconds (default {DEFAULT_TIMEOUT:g})")
+    _block_args(r)
+    r.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help=f"engine time limit in seconds, per block (default {DEFAULT_TIMEOUT:g})")
     r.add_argument("--overwrite", action="store_true", help="allow replacing an existing output")
     r.add_argument("--ffmpeg-skill", help="ffmpeg-skill checkout directory")
     r.add_argument("--offline", action="store_true", help="no network (every registered engine already needs none)")
@@ -92,7 +99,8 @@ def build_parser() -> argparse.ArgumentParser:
     lo, hi = CROSSTALK_LIMITS["dominance_db"]
     b.add_argument("--dominance-db", type=float, help=f"how much louder a track must be than another for a bin to count as its "
                    f"talker when the bleed is measured, {lo:g}-{hi:g} dB (default {CROSSTALK_DEFAULTS['dominance_db']:g})")
-    b.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help=f"engine time limit in seconds (default {DEFAULT_TIMEOUT:g})")
+    _block_args(b)
+    b.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help=f"engine time limit in seconds, per block (default {DEFAULT_TIMEOUT:g})")
     b.add_argument("--overwrite", action="store_true", help="allow replacing existing outputs")
     b.add_argument("--ffmpeg-skill", help="ffmpeg-skill checkout directory")
     b.add_argument("--offline", action="store_true", help="no network (every registered engine already needs none)")
@@ -111,6 +119,14 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--offline", action="store_true", help="accepted for symmetry; remux never uses the network")
     m.add_argument("--json", action="store_true")
     return ap
+
+
+def _block_args(p: argparse.ArgumentParser) -> None:
+    lo, hi = BLOCK_LIMITS
+    p.add_argument("--block-seconds", type=float, help=f"a longer input is processed in blocks of at most this length, {lo:g}-{hi:g} "
+                   f"(default {BLOCK_SECONDS:g}), each overlapping the next by {OVERLAP_SECONDS:g} s and crossfaded at the seam")
+    p.add_argument("--cache-dir", help=f"where finished blocks are kept so a stopped run resumes at the first missing block (default: "
+                   f"{CACHE_NAME} next to the output); emptied when the run succeeds")
 
 
 def _int_list(text: str) -> List[int]:
@@ -189,13 +205,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             _emit(isolate(IsolateRequest(input_path=args.input, output_path=args.output, audio_stream=args.audio_stream,
                                          engine=args.engine, timeout=args.timeout, overwrite=args.overwrite,
                                          atten_lim_db=args.atten_lim_db, ffmpeg_skill_dir=args.ffmpeg_skill,
-                                         offline=args.offline)), as_json)
+                                         offline=args.offline, block_seconds=args.block_seconds, cache_dir=args.cache_dir)), as_json)
             return 0
         if args.cmd == "dereverb":
             _emit(dereverb(DereverbRequest(input_path=args.input, output_path=args.output, audio_stream=args.audio_stream,
                                            engine=args.engine, timeout=args.timeout, overwrite=args.overwrite, taps=args.taps,
                                            delay=args.delay, iterations=args.iterations, ffmpeg_skill_dir=args.ffmpeg_skill,
-                                           offline=args.offline)), as_json)
+                                           offline=args.offline, block_seconds=args.block_seconds, cache_dir=args.cache_dir)), as_json)
             return 0
         if args.cmd == "remux":
             _emit(remux(RemuxRequest(input_path=args.input, stem_path=args.stem, output_path=args.output,
@@ -206,7 +222,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             _emit(bleed_reduce(BleedReduceRequest(input_paths=args.inputs, output_dir=args.output, audio_streams=args.audio_streams,
                                                   engine=args.engine, timeout=args.timeout, overwrite=args.overwrite,
                                                   dominance_db=args.dominance_db, ffmpeg_skill_dir=args.ffmpeg_skill,
-                                                  offline=args.offline)), as_json)
+                                                  offline=args.offline, block_seconds=args.block_seconds,
+                                                  cache_dir=args.cache_dir)), as_json)
             return 0
     except VoiceEnhanceError as e:
         _emit({"ok": False, "skill": {"id": SKILL_ID, "version": __version__}, "error": e.to_dict()}, as_json)

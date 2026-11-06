@@ -60,6 +60,10 @@ The `crosstalk` engine is signal processing on NumPy, with no model and no weigh
 
 Each track is written to `<out_dir>/<input name>_a<stream>.wav` as mono 32-bit float, with its own length and sample-aligned with its input. Every stem is checked through ffmpeg-skill/probe before any is placed. A new output directory appears whole or not at all. In an existing one no file is replaced without `--overwrite`. The op does not align tracks: separately recorded tracks have to be lined up first (ffmpeg-skill `sync`), and a length difference gives a warning. Two microphones on the two channels of one stream cannot be separated, because ffmpeg-skill has no channel-select flag yet, so such a stream is folded down to one track (with a warning). `--timeout` works as for `isolate`.
 
+## Long recordings
+
+`isolate`, `dereverb` and `bleed-reduce` process an input longer than `--block-seconds` (default 600 s) in blocks that overlap by 4 s, with a raised-cosine crossfade at each seam. Every finished block is cached in `.voice-enhance-blocks` next to the output (or `--cache-dir`), keyed by the SHA-256 of its input samples, the engine and its settings. A run that stops (an engine failure, a timeout, a kill) resumes at the first missing block when the same command runs again, and the cache is emptied when the run succeeds. `--timeout` applies to each block. The result's `blocks` says what was cached, processed and resumed, and `timing.realtime_factor` is the engine's seconds per second of audio, so the time a whole day takes can be told in advance ([ADR-009](docs/decisions.md)).
+
 ## remux
 
 `remux` puts a stem (from `isolate`, `dereverb` or `bleed-reduce`, or any audio file) back into its video with one ffmpeg-skill `audio --replace` call. The video stream is copied packet for packet, not re-encoded. The stem becomes the output's only audio stream, encoded by the container (AAC for `.mp4`, `.mov` and `.mkv`), and is padded with silence or trimmed to the video's length. The output keeps the input's container (same extension). A container change is ffmpeg-skill `export`'s job.

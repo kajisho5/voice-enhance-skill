@@ -40,8 +40,9 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import SKILL_ID, __version__
+from .blocks import CACHE_NAME, check_block_seconds, run_blocked
 from .engines import DEFAULT_ENGINE, engines_for, get_engine
-from .engines.base import OK, Engine, EngineRequest
+from .engines.base import OK, Engine
 from .engines.crosstalk import LIMITS as CROSSTALK_LIMITS, MAX_TRACKS, MIN_TRACKS
 from .engines.nara_wpe_engine import LIMITS as WPE_LIMITS
 from .errors import VoiceEnhanceError
@@ -74,6 +75,8 @@ class IsolateRequest:
     atten_lim_db: Optional[float] = None
     ffmpeg_skill_dir: Optional[str] = None
     offline: bool = False
+    block_seconds: Optional[float] = None
+    cache_dir: Optional[str] = None
 
 
 @dataclass
@@ -89,6 +92,8 @@ class DereverbRequest:
     iterations: Optional[int] = None
     ffmpeg_skill_dir: Optional[str] = None
     offline: bool = False
+    block_seconds: Optional[float] = None
+    cache_dir: Optional[str] = None
 
 
 @dataclass
@@ -102,6 +107,8 @@ class BleedReduceRequest:
     dominance_db: Optional[float] = None
     ffmpeg_skill_dir: Optional[str] = None
     offline: bool = False
+    block_seconds: Optional[float] = None
+    cache_dir: Optional[str] = None
 
 
 def check_paths(input_path: str, output_path: str, overwrite: bool) -> Tuple[str, str]:
@@ -252,6 +259,45 @@ def _check_common(req: Any) -> None:
         raise VoiceEnhanceError("INVALID_ARGUMENT", "--timeout must be > 0", {"timeout": req.timeout})
     if not isinstance(req.audio_stream, int) or req.audio_stream < 0:
         raise VoiceEnhanceError("INVALID_ARGUMENT", "--audio-stream must be an integer >= 0", {"audio_stream": req.audio_stream})
+    check_block_seconds(req.block_seconds)
+
+
+def _identity(report: Dict[str, Any]) -> Dict[str, Any]:
+    """What names the engine build in a block's cache key (step 11, ADR-009)."""
+    return {k: report.get(k) for k in ("version", "model", "model_bytes", "numpy")}
+
+
+def _cache_dir(given: Optional[str], directory: str) -> str:
+    return os.path.abspath(given) if given else os.path.join(directory, CACHE_NAME)
+
+
+def _merge_dereverb(extras: List[Dict[str, Any]]) -> Dict[str, Any]:
+    out = dict(extras[0])
+    ranks = [x.get("independent_channels") for x in extras if isinstance(x.get("independent_channels"), int)]
+    if ranks:
+        out["independent_channels"] = min(ranks)
+    return out
+
+
+def _merge_bleed(extras: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Each block measures its own coupling (ADR-009): the result reports the mean over the blocks that measured a
+    pair, and None only where no block could."""
+    out = dict(extras[0])
+    rows = [x.get("coupling_db") or [] for x in extras]
+    n = len(rows[0])
+    mean: List[List[Optional[float]]] = []
+    for i in range(n):
+        row: List[Optional[float]] = []
+        for j in range(n):
+            vals = [r[i][j] for r in rows if len(r) > i and len(r[i]) > j and isinstance(r[i][j], (int, float))]
+            row.append(round(sum(vals) / len(vals), 2) if vals else None)
+        mean.append(row)
+    out["coupling_db"] = mean
+    out["first_order_bins"] = sum(int(x.get("first_order_bins") or 0) for x in extras)
+    bins = [x.get("estimation_bins") for x in extras if isinstance(x.get("estimation_bins"), list)]
+    if bins:
+        out["estimation_bins"] = [[sum(b[i][j] for b in bins) for j in range(len(bins[0][i]))] for i in range(len(bins[0]))]
+    return out
 
 
 def _check_numbers(req: IsolateRequest) -> None:
@@ -307,8 +353,9 @@ def isolate(req: IsolateRequest, skill: Optional[FfmpegSkill] = None) -> Dict[st
         if req.atten_lim_db is not None:
             params["atten_lim_db"] = float(req.atten_lim_db)
         stem = os.path.join(run_dir, "stem.wav")
-        result = run_engine(engine.id, EngineRequest(op="isolate", input_path=prepared, output_path=stem, sample_rate=ISOLATE_RATE,
-                                                     params=params), float(req.timeout), run_dir)
+        run = run_blocked(run_engine, engine.id, "isolate", [prepared], [stem], ISOLATE_RATE, params, float(req.timeout), run_dir,
+                          _identity(report), _cache_dir(req.cache_dir, os.path.dirname(dst)), check_block_seconds(req.block_seconds))
+        result = run.result
         out_facts = validate_output(skill, result.output_path, ISOLATE_RATE, float(prepared_facts.get("duration") or 0.0), engine.id)
         engine_doc = dict(report, version=result.engine_version, model=result.model, model_sha256=result.extra.get("model_sha256"))
         parameters = {"audio_stream": req.audio_stream, "atten_lim_db": result.extra.get("atten_lim_db"),
@@ -317,6 +364,7 @@ def isolate(req: IsolateRequest, skill: Optional[FfmpegSkill] = None) -> Dict[st
         provenance = build_provenance(op="isolate", engine=engine_doc, input_path=src, output_path=result.output_path,
                                       parameters=parameters, ffmpeg_skill=info.to_dict())
         _place(result.output_path, dst, req.overwrite)
+        run.discard_cache()
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
     return {
@@ -330,6 +378,8 @@ def isolate(req: IsolateRequest, skill: Optional[FfmpegSkill] = None) -> Dict[st
         "engine": {k: engine_doc.get(k) for k in ("id", "version", "model", "model_sha256")},
         "parameters": parameters,
         "steps": steps,
+        "blocks": run.blocks,
+        "timing": run.timing,
         "provenance": provenance,
         "warnings": warnings,
     }
@@ -363,8 +413,10 @@ def dereverb(req: DereverbRequest, skill: Optional[FfmpegSkill] = None) -> Dict[
         params: Dict[str, Any] = {"timeout": float(req.timeout)}
         params.update({k: getattr(req, k) for k in ("taps", "delay", "iterations") if getattr(req, k) is not None})
         stem = os.path.join(run_dir, "stem.wav")
-        result = run_engine(engine.id, EngineRequest(op="dereverb", input_path=prepared, output_path=stem, sample_rate=rate,
-                                                     params=params), float(req.timeout), run_dir)
+        run = run_blocked(run_engine, engine.id, "dereverb", [prepared], [stem], rate, params, float(req.timeout), run_dir,
+                          _identity(report), _cache_dir(req.cache_dir, os.path.dirname(dst)), check_block_seconds(req.block_seconds),
+                          merge=_merge_dereverb)
+        result = run.result
         out_facts = validate_output(skill, result.output_path, rate, float(prepared_facts.get("duration") or 0.0), engine.id,
                                     channels=channels)
         engine_doc = dict(report, version=result.engine_version, model=result.model, model_sha256=None)
@@ -376,6 +428,7 @@ def dereverb(req: DereverbRequest, skill: Optional[FfmpegSkill] = None) -> Dict[
         provenance = build_provenance(op="dereverb", engine=engine_doc, input_path=src, output_path=result.output_path,
                                       parameters=parameters, ffmpeg_skill=info.to_dict())
         _place(result.output_path, dst, req.overwrite)
+        run.discard_cache()
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
     return {
@@ -389,6 +442,8 @@ def dereverb(req: DereverbRequest, skill: Optional[FfmpegSkill] = None) -> Dict[
         "engine": {k: engine_doc.get(k) for k in ("id", "version", "model")},
         "parameters": parameters,
         "steps": [step],
+        "blocks": run.blocks,
+        "timing": run.timing,
         "provenance": provenance,
         "warnings": _dereverb_warnings(channels, parameters.get("independent_channels")),
     }
@@ -419,6 +474,7 @@ def _check_bleed(req: BleedReduceRequest) -> None:
     d = req.dominance_db
     if d is not None and (isinstance(d, bool) or not isinstance(d, (int, float)) or not lo <= float(d) <= hi):
         raise VoiceEnhanceError("INVALID_ARGUMENT", f"--dominance-db must be a number from {lo:g} to {hi:g}", {"dominance_db": d})
+    check_block_seconds(req.block_seconds)
 
 
 def _check_bleed_paths(req: BleedReduceRequest) -> Tuple[List[str], str]:
@@ -524,7 +580,8 @@ def bleed_reduce(req: BleedReduceRequest, skill: Optional[FfmpegSkill] = None) -
     dsts = _check_outputs(tracks, srcs, out_dir, req.overwrite)
     rate = _check_rates(skill, tracks)
     # In the output directory, or next to it when it does not exist yet, so every stem is placed by a rename.
-    run_dir = _run_dir(out_dir if os.path.isdir(out_dir) else os.path.dirname(out_dir), req.output_dir)
+    work_parent = out_dir if os.path.isdir(out_dir) else os.path.dirname(out_dir)
+    run_dir = _run_dir(work_parent, req.output_dir)
     try:
         steps: List[Dict[str, Any]] = []
         warnings: List[str] = []
@@ -546,9 +603,10 @@ def bleed_reduce(req: BleedReduceRequest, skill: Optional[FfmpegSkill] = None) -
         params: Dict[str, Any] = {"timeout": float(req.timeout)}
         if req.dominance_db is not None:
             params["dominance_db"] = float(req.dominance_db)
-        result = run_engine(engine.id, EngineRequest(op="bleed_reduce", input_path=prepared[0], output_path=stems[0], sample_rate=rate,
-                                                     params=params, input_paths=prepared, output_paths=stems),
-                            float(req.timeout), run_dir)
+        run = run_blocked(run_engine, engine.id, "bleed_reduce", prepared, stems, rate, params, float(req.timeout), run_dir,
+                          _identity(report), _cache_dir(req.cache_dir, work_parent), check_block_seconds(req.block_seconds),
+                          merge=_merge_bleed)
+        result = run.result
         if result.output_paths != stems:
             raise VoiceEnhanceError("INVALID_RESULT", f"engine {engine.id!r} returned {len(result.output_paths)} output paths for "
                                     f"{len(stems)} tracks", {"engine": engine.id})
@@ -568,6 +626,7 @@ def bleed_reduce(req: BleedReduceRequest, skill: Optional[FfmpegSkill] = None) -
         provenance = build_provenance(op="bleed_reduce", engine=engine_doc, input_path=list(dict.fromkeys(srcs)), output_path=stems,
                                       parameters=parameters, ffmpeg_skill=info.to_dict())
         _place_all(stems, dsts, stem_dir, out_dir, req.overwrite)
+        run.discard_cache()
     finally:
         shutil.rmtree(run_dir, ignore_errors=True)
     return {
@@ -583,6 +642,8 @@ def bleed_reduce(req: BleedReduceRequest, skill: Optional[FfmpegSkill] = None) -
         "engine": {k: engine_doc.get(k) for k in ("id", "version", "model")},
         "parameters": parameters,
         "steps": steps,
+        "blocks": run.blocks,
+        "timing": run.timing,
         "provenance": provenance,
         "warnings": warnings,
     }

@@ -193,6 +193,21 @@ class IsolateIntegrationTests(unittest.TestCase):
         self.assertLessEqual(len(clean) - len(stem), 1920)
         self.assertGreaterEqual(len(clean) - len(stem), 0)
 
+    @unittest.skipUnless(real_engine_ok(), NO_REAL_DEEP_FILTER)
+    def test_real_deep_filter_in_blocks(self):
+        # Roadmap step 11 (ADR-009): 40 s in 15 s blocks (4 worker calls). Each real block ends 1440 samples early;
+        # that stays inside the 4 s overlap, the joined stem passes the probe check, and the SNR rises as in one piece.
+        src = os.path.join(self.tmp, "noisy.wav")
+        clean = voice_noise_fixture(src, seconds=40.0, snr_db=0.0)
+        out = os.path.join(self.tmp, "voice.wav")
+        doc = isolate(IsolateRequest(src, out, block_seconds=15.0), skill=self.skill)
+        self.assertEqual((doc["blocks"]["count"], doc["blocks"]["processed"]), (4, [0, 1, 2, 3]))
+        self.assertGreater(doc["timing"]["realtime_factor"], 0)
+        stem = read_wav(out)[2]
+        self.assertLessEqual(len(clean) - len(stem), 1920)
+        before, after = snr_db(clean, read_wav(src)[2]), snr_db(clean, stem)
+        self.assertGreater(after, before + REAL_ISOLATE_MIN_GAIN_DB, (before, after))
+
 
 @unittest.skipUnless(FFMPEG_SKILL_DIR and HAVE_FFMPEG, "needs an ffmpeg-skill checkout and ffmpeg/ffprobe on PATH")
 class DereverbIntegrationTests(unittest.TestCase):
@@ -237,6 +252,23 @@ class DereverbIntegrationTests(unittest.TestCase):
             rc, doc = run_cli("dereverb", src, "-o", out, "--ffmpeg-skill", str(FFMPEG_SKILL_DIR), "--json")
         self.assertEqual((rc, doc["ok"], doc["output"]["sample_rate"], doc["output"]["channels"]), (0, True, 44100, 1), doc)
         self.assertAlmostEqual(doc["output"]["duration"], 0.5, delta=0.02)
+
+    @unittest.skipUnless(have_numpy(), "needs numpy: the fake nara_wpe computes on it")
+    def test_blocks_through_real_ffmpeg_skill(self):
+        # Roadmap step 11 (ADR-009): 40 s stereo in 15 s blocks; the joined float WAV (with its JUNK chunk reserving
+        # room for RF64) passes the real ffmpeg-skill probe, and every channel is drier, across the seams too.
+        src = os.path.join(self.tmp, "pair.wav")
+        dry = reverb_fixture(src, seconds=40.0, rate=16000, channels=2, distinct=True)
+        out = os.path.join(self.tmp, "dry.wav")
+        with on_python_path(fake_nara_wpe(os.path.join(self.tmp, "engine"))):
+            doc = dereverb(DereverbRequest(src, out, block_seconds=15.0), skill=self.skill)
+        self.assertEqual((doc["blocks"]["count"], doc["output"]["channels"], doc["output"]["codec"]), (4, 2, "pcm_f32le"))
+        self.assertAlmostEqual(doc["output"]["duration"], 40.0, delta=0.01)
+        self.assertEqual(doc["parameters"]["independent_channels"], 2)
+        for k, (wet, out_ch) in enumerate(zip(read_wav_channels(src)[1], read_float_wav_channels(out)[1])):
+            self.assertEqual(len(out_ch), len(wet))
+            self.assertGreater(srr_db(dry, out_ch), srr_db(dry, wet) + 6.0, k)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, ".voice-enhance-blocks")))
 
     @unittest.skipUnless(real_wpe_ok(), "nara_wpe is not installed (only CI's engines job installs it, ADR-007)")
     def test_real_nara_wpe_raises_srr(self):

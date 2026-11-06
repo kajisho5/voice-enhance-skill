@@ -10,34 +10,46 @@ from .engines import DEFAULT_ENGINE, engine_ids, get_engine
 from .errors import ERROR_TABLE
 from .ffmpeg_skill import FLAGS_USED, OPTIONAL_FLAGS, SUPPORTED_CONTRACT_VERSION, TOOLS_USED
 from .engines.crosstalk import DEFAULTS as CROSSTALK_DEFAULTS, MAX_TRACKS, MIN_TRACKS
+from .blocks import BLOCK_LIMITS, BLOCK_SECONDS, CACHE_NAME, OVERLAP_SECONDS
 from .ops import BLEED_REDUCE_SCHEMA, DEREVERB_SCHEMA, ISOLATE_RATE, ISOLATE_SCHEMA, REMUX_SCHEMA, REMUX_STEP, REMUX_VIDEO_KEYS
 
 CONTRACT_VERSION = "1.0"
+_BLOCK_ARGV = (f"[--block-seconds {BLOCK_SECONDS:g}]", "[--cache-dir <dir>]")
+# Roadmap step 11 (ADR-009): long inputs in overlapping blocks, each cached by its input hash, so a stopped run resumes.
+BLOCKS = {"default_block_seconds": BLOCK_SECONDS, "block_seconds_range": list(BLOCK_LIMITS), "overlap_seconds": OVERLAP_SECONDS,
+          "crossfade": "raised cosine over the middle half of each overlap",
+          "cache": f"<output directory>/{CACHE_NAME} unless --cache-dir; a block's key hashes its input samples, the engine's "
+                   "identity and parameters; the run's entries are deleted once the output is placed",
+          "resume": "a run with the same input and settings reuses every cached block and resumes at the first missing one",
+          "timeout": "--timeout applies to each block's engine call",
+          "result": {"blocks": ["count", "block_seconds", "overlap_seconds", "crossfade", "starts", "processed", "cached",
+                                "resumed_from", "cache_dir"],
+                     "timing": ["engine", "engine_seconds", "audio_seconds", "realtime_factor", "engine_seconds_this_run"]}}
 CAPABILITY_IDS = {"isolate": "voice.isolate", "dereverb": "voice.dereverb", "bleed_reduce": "voice.bleed_reduce"}
 _OP_TOOLS = {
     "isolate": {"description": "Voice stem of a recording with noise and background removed (AI, DeepFilterNet3)",
                 "argv": ["isolate", "<media>", "-o <out.wav>", "[--audio-stream 0]", "[--engine deepfilternet]",
-                         "[--atten-lim-db <0-100>]", "[--timeout 3600]", "[--overwrite]", "[--ffmpeg-skill <dir>]", "[--offline]",
+                         "[--atten-lim-db <0-100>]", *_BLOCK_ARGV, "[--timeout 3600]", "[--overwrite]", "[--ffmpeg-skill <dir>]", "[--offline]",
                          "--json"],
                 "schema": ISOLATE_SCHEMA,
                 "output": {"format": "wav", "sample_rate": ISOLATE_RATE, "channels": 1,
                            "alignment": "sample-aligned with the input (deep-filter -D compensates its delay)"},
                 "result_keys": ["schema", "ok", "op", "capability", "skill", "output", "input", "engine", "parameters", "steps",
-                                "provenance", "warnings"]},
+                                "blocks", "timing", "provenance", "warnings"]},
     "dereverb": {"description": "Speech with room reverberation reduced (WPE, nara_wpe)",
                  "argv": ["dereverb", "<media>", "-o <out.wav>", "[--audio-stream 0]", "[--engine nara_wpe]", "[--taps 10]",
-                          "[--delay 3]", "[--iterations 3]", "[--timeout 3600]", "[--overwrite]", "[--ffmpeg-skill <dir>]",
+                          "[--delay 3]", "[--iterations 3]", *_BLOCK_ARGV, "[--timeout 3600]", "[--overwrite]", "[--ffmpeg-skill <dir>]",
                           "[--offline]", "--json"],
                  "schema": DEREVERB_SCHEMA,
                  "output": {"format": "wav", "codec": "pcm_f32le", "sample_rate": "same as the input stream",
                             "channels": "same as the input stream (multi-channel WPE)",
                             "alignment": "sample-aligned with the input (WPE subtracts a prediction; no delay is added)"},
                  "result_keys": ["schema", "ok", "op", "capability", "skill", "output", "input", "engine", "parameters", "steps",
-                                 "provenance", "warnings"]},
+                                 "blocks", "timing", "provenance", "warnings"]},
     "bleed_reduce": {"description": "Per-microphone tracks with cross-talk from the other microphones reduced (signal processing, "
                                     "no model weights)",
                      "argv": ["bleed-reduce", "<media>...", "-o <out_dir>", "[--audio-streams 0,1]", "[--engine crosstalk]",
-                              f"[--dominance-db {CROSSTALK_DEFAULTS['dominance_db']:g}]", "[--timeout 3600]", "[--overwrite]",
+                              f"[--dominance-db {CROSSTALK_DEFAULTS['dominance_db']:g}]", *_BLOCK_ARGV, "[--timeout 3600]", "[--overwrite]",
                               "[--ffmpeg-skill <dir>]", "[--offline]", "--json"],
                      "schema": BLEED_REDUCE_SCHEMA,
                      "input": {"tracks": f"{MIN_TRACKS}-{MAX_TRACKS} time-aligned microphone tracks: the audio streams of one file "
@@ -47,7 +59,7 @@ _OP_TOOLS = {
                                 "sample_rate": "the first track's", "channels": 1,
                                 "alignment": "sample-aligned with each input (linear per-bin demixing; no delay is added)"},
                      "result_keys": ["schema", "ok", "op", "capability", "skill", "output_dir", "outputs", "inputs", "engine",
-                                     "parameters", "steps", "provenance", "warnings"]},
+                                     "parameters", "steps", "blocks", "timing", "provenance", "warnings"]},
 }
 
 
@@ -117,6 +129,7 @@ def contract() -> Dict[str, Any]:
                          "downloading engines or model weights (one-time manual step; doctor says how)",
                          "network access of any kind at run time", "direct ffmpeg calls (every media step is an ffmpeg-skill tool)"],
         "tools": tools(),
+        "long_inputs": BLOCKS,
         "engines": {"registered": {eid: get_engine(eid).spec() for eid in engine_ids()},
                     "default": dict(DEFAULT_ENGINE),
                     "selection_adr": "docs/decisions.md ADR-001",
