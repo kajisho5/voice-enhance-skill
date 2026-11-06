@@ -2,6 +2,13 @@
 
 ## 0.1.0 - unreleased
 
+Long inputs in blocks, resumable (roadmap step 11).
+
+- ADR-009: `isolate`, `dereverb` and `bleed-reduce` process an input longer than `--block-seconds` (default 600, 15-3600) in blocks that overlap by 4 s, joined with a raised-cosine crossfade over the middle half of each overlap. Each block's output is cached (`.voice-enhance-blocks` next to the output, or `--cache-dir`) under the SHA-256 of its input samples, the engine and its parameters, so a run that stops resumes at the first missing block. The cache is emptied on success. `--timeout` applies to each block. An input no longer than one block runs exactly as before.
+- New result sections `blocks` (count, starts, processed, cached, resumed_from, cache_dir) and `timing` (engine seconds, audio seconds, `realtime_factor`); new contract section `long_inputs`. Additive: the result schemas stay `@1`.
+- Joined outputs become RF64 above 4 GiB; `WavReader` reads RF64.
+- Tests: a 1 h fixture stopped after 3 of 7 blocks resumes, and its output equals an uninterrupted run (bit-identical, far below -90 dB).
+
 ffmpeg-skill 3.0.0 (ADR-008).
 
 - ffmpeg-skill 3.x declares `contract_version` 2.0; it is read like 1.0, with no warning. Only `probe` and `audio` are used, and nothing they take changed. The CI integration job also runs against 3.0.0, pinned by commit. Python 3.9 stays supported here: the unit jobs never run ffmpeg-skill, and its integration jobs run Python 3.12.

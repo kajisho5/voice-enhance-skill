@@ -2,7 +2,8 @@
 for BLEED_REDUCE, ADR-005). NumPy is passed in as `np` by the caller, never imported here, so this module imports with
 the stdlib only and doctor stays fast.
 
-  WavReader       a RIFF/WAVE file read in frames on demand (PCM 16/24/32-bit, float 32/64-bit, plain or extensible)
+  WavReader       a RIFF/WAVE file read in frames on demand (PCM 16/24/32-bit, float 32/64-bit, plain or extensible;
+                  RF64 for files above 4 GiB)
   FloatWavWriter  32-bit float WAV written front to back
   TrackReader     several mono WAVs read as the channels of one signal (zeros past a shorter file's end)
   TrackWriter     the channels of one signal written as several float WAVs, each cut to its own length
@@ -41,16 +42,23 @@ class WavReader:
 
     def _parse(self, path: str) -> None:
         head = self.fh.read(12)
-        if len(head) < 12 or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+        if len(head) < 12 or head[:4] not in (b"RIFF", b"RF64") or head[8:12] != b"WAVE":
             raise VoiceEnhanceError("INVALID_ARGUMENT", f"{os.path.basename(path)} is not a RIFF/WAVE file")
         fmt = None
         self.data_offset = self.data_bytes = None
+        ds64_data = None                    # RF64 (EBU Tech 3306): the 64-bit data size lives in the ds64 chunk
         while True:
             chunk = self.fh.read(8)
             if len(chunk) < 8:
                 break
             cid, size = chunk[:4], struct.unpack("<I", chunk[4:])[0]
-            if cid == b"fmt ":
+            if cid == b"ds64":
+                body = self.fh.read(size)
+                if len(body) >= 16:
+                    ds64_data = struct.unpack("<Q", body[8:16])[0]
+                if size & 1:
+                    self.fh.seek(1, os.SEEK_CUR)
+            elif cid == b"fmt ":
                 body = self.fh.read(size)
                 fmt = struct.unpack("<HHIIHH", body[:16])
                 if fmt[0] == 0xFFFE and len(body) >= 26:
@@ -58,6 +66,8 @@ class WavReader:
                 if size & 1:
                     self.fh.seek(1, os.SEEK_CUR)
             elif cid == b"data":
+                if size == 0xFFFFFFFF:      # RF64, or a writer that could not fit the size: the data runs to the end
+                    size = ds64_data if ds64_data is not None else 1 << 62
                 self.data_offset, self.data_bytes = self.fh.tell(), size
                 break
             else:

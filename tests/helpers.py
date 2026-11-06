@@ -65,10 +65,19 @@ def env(**values: Optional[str]) -> Iterator[None]:
 #   sleep      writes its pid to pid and sleeps (timeout / process-group tests)
 #   nooutput   exits 0 without writing anything
 #   wrongrate  writes a 16 kHz file
+#   gain       halves every sample and, like the real binary with -D, drops the last 1440 samples (fast, any length)
+# With a file stop_after (holding N) next to the program, every call after the N-th exits 1: a run that stops halfway.
 FAKE_PROGRAM = r"""
 import json, math, os, struct, sys, time, wave
+from array import array
 mode, args = sys.argv[1], sys.argv[2:]
 here = os.path.dirname(os.path.abspath(__file__))
+if os.path.exists(os.path.join(here, "stop_after")):
+    count_path = os.path.join(here, "count")
+    count = (int(open(count_path).read()) if os.path.exists(count_path) else 0) + 1
+    open(count_path, "w").write(str(count))
+    if count > int(open(os.path.join(here, "stop_after")).read()):
+        sys.stderr.write("fake deep-filter stopped\n"); sys.exit(1)
 with open(os.path.join(here, "argv.json"), "w") as fh:
     json.dump(args, fh)
 opts, files, i = {}, [], 0
@@ -92,6 +101,15 @@ with wave.open(files[0], "rb") as w:
 if rate != 48000:
     sys.stderr.write("Error: input sample rate %d does not match the model (48000)\n" % rate); sys.exit(1)
 if mode == "nooutput":
+    sys.exit(0)
+if mode == "gain":
+    a = array("h"); a.frombytes(raw)
+    if sys.byteorder == "big": a.byteswap()
+    a = array("h", [v // 2 for v in a[::ch][:max(0, n - 1440)]])
+    if sys.byteorder == "big": a.byteswap()
+    os.makedirs(opts["-o"], exist_ok=True)
+    with wave.open(os.path.join(opts["-o"], os.path.basename(files[0])), "wb") as w:
+        w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate); w.writeframes(a.tobytes())
     sys.exit(0)
 x = [v / 32768.0 for v in struct.unpack("<%dh" % (n * ch), raw)][::ch]
 def biquad(sig, fc=2000.0, fs=48000.0, q=0.7071067811865476):
@@ -246,11 +264,19 @@ def write_tone_wav(path: str, seconds: float = 1.0, rate: int = 48000, freq: flo
 #   identity   returns Y unchanged (the STFT round trip must give the input back, sample-aligned)
 #   fail       raises RuntimeError
 #   badshape   returns an array of the wrong shape
+# With a file stop_after (holding N) next to the package, every worker process after the N-th fails: each block of a
+# long input is one worker, so this is a run that stops after N blocks.
 FAKE_WPE_PROGRAM = r'''
 import json, os
 import numpy as np
 MODE = __MODE__
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+STOPPED = False
+if os.path.exists(os.path.join(HERE, "stop_after")):
+    _count_path = os.path.join(HERE, "workers")
+    _count = (int(open(_count_path).read()) if os.path.exists(_count_path) else 0) + 1
+    open(_count_path, "w").write(str(_count))
+    STOPPED = _count > int(open(os.path.join(HERE, "stop_after")).read())
 
 
 def wpe_v8(Y, taps=10, delay=3, iterations=3, psd_context=0, statistics_mode="full", inplace=False):
@@ -259,6 +285,8 @@ def wpe_v8(Y, taps=10, delay=3, iterations=3, psd_context=0, statistics_mode="fu
     calls.append({"shape": list(Y.shape), "dtype": str(Y.dtype), "taps": taps, "delay": delay, "iterations": iterations,
                   "statistics_mode": statistics_mode})
     json.dump(calls, open(path, "w"))
+    if STOPPED:
+        raise RuntimeError("fake nara_wpe stopped")
     if MODE == "fail":
         raise RuntimeError("fake nara_wpe failed")
     if MODE == "badshape":
