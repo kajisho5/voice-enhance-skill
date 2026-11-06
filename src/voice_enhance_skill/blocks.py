@@ -337,12 +337,12 @@ def run_blocked(run_engine: RunEngine, engine_id: str, op: str, inputs: List[str
                                 input_paths=block_in if multi else [], output_paths=block_out if multi else [])
             t0 = time.monotonic()
             result = run_engine(engine_id, req, timeout, work)
-            seconds = time.monotonic() - t0
+            seconds = round(time.monotonic() - t0, 3)       # as kept in block.json, so the sums below agree
             this_run += seconds
             for path, r in zip(block_out, readers if multi else readers[:1]):
                 _check_length(engine_id, k, path, max(0, min(end, r.frames) - start), rate)
             meta = {"schema": CACHE_SCHEMA, "key": key, "op": op, "engine": engine_id, "engine_version": result.engine_version,
-                    "model": result.model, "index": k, "start": start, "frames": end - start, "engine_seconds": round(seconds, 3),
+                    "model": result.model, "index": k, "start": start, "frames": end - start, "engine_seconds": seconds,
                     "outputs": names, "extra": result.extra}
             tmp = os.path.join(cache_dir, f"{key}.tmp-{os.getpid()}")
             shutil.rmtree(tmp, ignore_errors=True)
