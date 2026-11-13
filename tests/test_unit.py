@@ -124,6 +124,13 @@ class ContractTests(unittest.TestCase):
         self.assertFalse(c["execution"]["network"])
         json.dumps(c, allow_nan=False)
 
+    def test_music_separation_names_no_owner(self):
+        # roadmap step 13: sound-design-skill generates music, it does not separate it; no skill owns separation
+        not_provided = contract()["not_provided"]
+        separation = [x for x in not_provided if "separation" in x]
+        self.assertEqual(separation, ["music / BGM separation (provided by no skill; a new owner needs an ADR first)"])
+        self.assertIn("music / BGM generation (sound-design-skill)", not_provided)
+
     def test_errors_and_engines_mirror_the_code(self):
         c = contract()
         self.assertEqual(c["errors"], {k: {"exit_code": e, "retryable": r} for k, (e, r) in ERROR_TABLE.items()})
