@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.1.0 - unreleased
+## 0.1.0 - 2026-11-13
+
+First release: the tag `v0.1.0` and its GitHub Release (roadmap step 12, ADR-010). From now on a pushed `v*` tag makes the GitHub Release from its CHANGELOG.md section (`.github/workflows/release.yml`); nothing is published to a package index.
 
 Long inputs in blocks, resumable (roadmap step 11).
 
