@@ -77,4 +77,4 @@ With `--json`, a failure is `{"ok": false, "error": {"code", "message", "retryab
 
 ## Not this skill's job
 
-Measuring audio (media-analysis-skill, qc-skill), loudness, EQ, fixed-setting noise reduction and mixing (audio-production-skill), aligning separately recorded tracks (ffmpeg-skill `sync`), changing the container or audio codec (ffmpeg-skill `export`), transcription (transcription-skill), who spoke when (diarization-skill), re-synthesising or cloning a voice (never: the engines remove, they do not generate).
+Measuring audio (media-analysis-skill, qc-skill), loudness, EQ, fixed-setting noise reduction and mixing (audio-production-skill), aligning separately recorded tracks (ffmpeg-skill `sync`), changing the container or audio codec (ffmpeg-skill `export`), transcription (transcription-skill), who spoke when (diarization-skill), re-synthesising or cloning a voice (never: the engines remove, they do not generate). Music / BGM generation is sound-design-skill's. Separating music / BGM from a mix is provided by no skill; a new owner needs an ADR first.
