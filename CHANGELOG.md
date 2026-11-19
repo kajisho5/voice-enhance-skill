@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.1.2 - 2026-11-19
+## 0.1.2 - 2026-11-19
 
 - ci: release on push to main (version from PR labels, tag and GitHub Release) (#21) (59d78d9)
 
