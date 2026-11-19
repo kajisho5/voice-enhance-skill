@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3 - 2026-11-19
+
+- fix(release): CHANGELOG headings in this file's form; test the release commit before pushing; no release for chore/ci/docs-only changes (#22) (2a0dffb)
+
 ## 0.1.2 - 2026-11-19
 
 - ci: release on push to main (version from PR labels, tag and GitHub Release) (#21) (59d78d9)
