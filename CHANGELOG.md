@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1 - 2026-11-19
+
+Contract shape only; no command, option, output document, tool, capability id or default changed. `contract_version` stays 1.0.
+
+- The contract follows the OS contract shape (Velisa `registry/capability_contract.schema.json`, Velisa ADR-018; ADR-011): `skill` is `{id, package, version}` instead of the package name as a string, and `dependencies` lists only ffmpeg-skill, with `skill_id` added (`id`, `kind`, `version_range`, `tools`, `flags` and the rest stay). The three engines (DeepFilterNet, NARA-WPE, the crosstalk engine) leave `dependencies`; each one's version range, licences, attribution, install line and location stay in `engines.registered`, and `doctor` reports each as before.
+- `contract/contract.json` is the contract committed as a file (`voice-enhance contract --json`, one line, sorted keys), so any tag's contract is `git show <tag>:contract/contract.json`. `python contract/generate.py` regenerates it, and a unit test (`--check`) and CI fail when it is stale.
+- Also first released here, merged after v0.1.0: `not_provided` says music / BGM separation is provided by no skill (roadmap step 13, #19).
+
 ## 0.1.0 - 2026-11-13
 
 First release: the tag `v0.1.0` and its GitHub Release (roadmap step 12, ADR-010). From now on a pushed `v*` tag makes the GitHub Release from its CHANGELOG.md section (`.github/workflows/release.yml`); nothing is published to a package index.

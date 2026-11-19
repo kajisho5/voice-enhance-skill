@@ -42,6 +42,8 @@ voice-enhance remux talk.mp4 talk_voice.wav -o talk_clean.mp4 --json   # the ste
 voice-enhance remux panel.mkv clean/panel_a0.wav -o panel_a0.mkv --drop-other-audio --json
 ```
 
+`contract/contract.json` is the contract committed as a file (`voice-enhance contract --json` as one line with sorted keys, compact separators and a final newline), so the contract of any commit or tag is `git show <ref>:contract/contract.json`, with nothing installed or run. Regenerate it with `python contract/generate.py`; a unit test fails when it is stale.
+
 ## isolate
 
 `isolate` picks one audio stream (`--audio-stream`, 0-based, default 0) and has ffmpeg-skill extract it as PCM WAV. A stream with more than one channel is folded down to mono in a second ffmpeg-skill pass. The engine runs on that WAV in the worker, and the stem is checked through ffmpeg-skill/probe (48 kHz, mono, same duration) before it is renamed into place. The output is always a 48 kHz mono `.wav`, sample-aligned with the input (`deep-filter -D`). The input is never modified, and an existing output is never replaced without `--overwrite`. `--atten-lim-db N` limits how far the background is pushed down (default: no limit). `--timeout` (default 3600 s) kills the engine and the worker's whole process group.
