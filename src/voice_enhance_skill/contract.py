@@ -99,8 +99,12 @@ def tools() -> list:
 
 
 def contract() -> Dict[str, Any]:
+    # Skill dependencies only (other Skills this one invokes), each with skill_id and version_range: the OS contract shape
+    # (Velisa registry/capability_contract.schema.json, ADR-018). The engines are not Skills: each one's version range,
+    # licences, attribution, install line and location are in engines.registered, and doctor reports whether it is there
+    # (as transcription-skill does). docs/decisions.md ADR-011.
     deps = [
-        {"id": "ffmpeg-skill", "kind": "skill", "required": True, "for": [CAPABILITY_IDS[o] for o in CAPABILITY_IDS],
+        {"skill_id": "ffmpeg-skill", "id": "ffmpeg-skill", "kind": "skill", "required": True, "for": [CAPABILITY_IDS[o] for o in CAPABILITY_IDS],
          "version_range": "any release whose contract declares the tools and flags below (capability detection)",
          "tools": list(TOOLS_USED), "flags": {t: list(f) for t, f in FLAGS_USED.items()},
          "optional_flags": {t: list(f) for t, f in OPTIONAL_FLAGS.items()},
@@ -108,15 +112,10 @@ def contract() -> Dict[str, Any]:
          "located_by": ["--ffmpeg-skill", "$VOICE_ENHANCE_FFMPEG_SKILL_DIR", "$VIDEO_AGENT_FFMPEG_SKILL_DIR",
                         "~/.claude/skills/ffmpeg-skill", "./vendor/ffmpeg-skill", "../ffmpeg-skill"]},
     ]
-    for eid in engine_ids():
-        e = get_engine(eid)
-        deps.append({"id": eid, "kind": "engine-" + e.kind, "required": False, "for": [CAPABILITY_IDS[o] for o in e.ops],
-                     "version_range": e.version_range, "license": e.code_license, "weights_license": e.weights_license,
-                     "install": e.install, "located_by": list(e.located_by), "downloaded_at_run_time": False})
     return {
         "skill_id": SKILL_ID,
         "id": SKILL_ID,
-        "skill": PACKAGE_NAME,
+        "skill": {"id": SKILL_ID, "package": PACKAGE_NAME, "version": __version__},
         "version": __version__,
         "contract_version": CONTRACT_VERSION,
         "provides": [{"id": CAPABILITY_IDS[op], "lifecycle": "EXPERIMENTAL" if IMPLEMENTED_OPS[op] else "PROPOSED",
