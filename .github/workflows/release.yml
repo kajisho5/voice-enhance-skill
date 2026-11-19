@@ -1,94 +1,131 @@
-name: release
+name: Release
 
-# Runs when a version tag (v*) is pushed (docs/decisions.md ADR-010). The tag is pushed by hand on
-# the main commit whose pyproject.toml carries that version; this job checks that the two agree,
-# takes the CHANGELOG.md section of that version as the notes and creates the GitHub Release.
-# Nothing is published to a package index: this skill is installed from a git checkout.
-#
-# A tag pushed by a person starts this workflow. A tag pushed with the default GITHUB_TOKEN would
-# not (GitHub's anti-recursion rule), so no other workflow here pushes tags.
+# Single job, triggered only by `push` to main -- deliberately not split into a second workflow
+# triggered by tag push. GitHub Actions does not re-trigger `on: push`/`on: <tag-push>` workflows for
+# a push made with the default GITHUB_TOKEN (its documented anti-recursion rule), so a tag/commit this
+# job pushes with that token would never start a second workflow: splitting the pipeline that way
+# would leave the tag-triggered half permanently unrun. Everything -- version decision, file bump,
+# contract/contract.json, CHANGELOG.md, tag, GitHub Release -- happens here instead (docs/decisions.md ADR-012).
 on:
   push:
-    tags: ["v*"]
-  # Also runnable by hand on main: it then releases the pyproject.toml version, creating its tag on
-  # the dispatched commit when the tag does not exist yet (for a first release cut where a tag
-  # cannot be pushed). The checks below are the same either way.
-  workflow_dispatch:
-
-permissions:
-  contents: read
+    branches: [main]
 
 concurrency:
-  group: release-${{ github.ref_name }}
-  cancel-in-progress: false
+  group: release-${{ github.ref }}
+  cancel-in-progress: false   # queue, never cancel a release partway through
+
+permissions:
+  contents: write
+  # write: the step before release-drafter removes release-level labels a bot put on Dependabot pull requests
+  pull-requests: write
 
 jobs:
   release:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write   # create the GitHub Release
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # full history + tags: compute_version.sh and render_changelog.sh need both
 
-      # The tag name reaches the script only through `env:`, never spliced into it with `${{ }}`.
-      - name: Check the tag against pyproject.toml and take its CHANGELOG section
-        env:
-          EVENT: ${{ github.event_name }}
-          REF_NAME: ${{ github.ref_name }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Read the current version (pyproject.toml)
+        id: current
         run: |
-          set -euo pipefail
-          version="$(sed -nE 's/^version = "([^"]+)"$/\1/p' pyproject.toml | head -n1)"
-          if [ "$EVENT" = "workflow_dispatch" ]; then
-            if [ "$REF_NAME" != "main" ]; then
-              echo "::error::run this workflow by hand on main only (got $REF_NAME)"
-              exit 1
-            fi
-            TAG="v$version"
+          CURRENT_VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "version=$CURRENT_VERSION" >> "$GITHUB_OUTPUT"
+
+      # Dependabot labels a pull request `major` when the dependency it bumps moved a major version, which says
+      # nothing about this product's version. A release-level label on a Dependabot pull request counts only when a
+      # person applied it; a failure here fails the release instead of resolving from unchecked labels.
+      - name: Drop release-level labels a bot put on Dependabot pull requests
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/dependabot_release_labels.py
+
+      - name: Resolve the next version (release-drafter, dry run)
+        id: drafter
+        continue-on-error: true   # bootstrap (no prior tag) can leave this with nothing to resolve;
+                                  # compute_version.sh only reads its output when it actually needs to
+        # v7: v6 has no dry-run input (it was silently ignored), and v7 dropped disable-autolabeler
+        uses: release-drafter/release-drafter@978bb0b30c5ee8cdd332ced253758157150d43f0 # v7.10.0
+        with:
+          dry-run: true
+          config-name: release-drafter.yml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide this push's release version
+        id: compute
+        env:
+          CURRENT_VERSION: ${{ steps.current.outputs.version }}
+          DRAFTER_RESOLVED_VERSION: ${{ steps.drafter.outputs.resolved_version }}  # underscore: resolved-version was always empty
+        run: bash .github/scripts/compute_version.sh
+
+      - name: Nothing to release
+        if: steps.compute.outputs.should_release != 'true'
+        run: echo "v${{ steps.compute.outputs.next_version }} is already tagged; nothing to do."
+
+      - name: Install the package (needed to regenerate the committed contract file)
+        if: steps.compute.outputs.should_release == 'true'
+        run: python3 -m pip install -q -e .
+
+      - name: Bump version files
+        if: steps.compute.outputs.should_release == 'true'
+        env:
+          CURRENT_VERSION: ${{ steps.current.outputs.version }}
+          NEXT_VERSION: ${{ steps.compute.outputs.next_version }}
+          REGENERATE_CONTRACT: "1"
+        run: bash .github/scripts/bump_version_files.sh
+
+      # The tag's contract/contract.json must be that tag's own contract output and report its version.
+      - name: Check the contract file against the version
+        if: steps.compute.outputs.should_release == 'true'
+        env:
+          NEXT_VERSION: ${{ steps.compute.outputs.next_version }}
+        run: |
+          python3 contract/generate.py --check
+          python3 - <<'PYEOF'
+          import json, os
+          doc = json.load(open("contract/contract.json", encoding="utf-8"))
+          want = os.environ["NEXT_VERSION"]
+          skill = doc.get("skill")
+          got = {"version": doc.get("version"), "skill.version": skill.get("version") if isinstance(skill, dict) else want}
+          bad = {k: v for k, v in got.items() if v != want}
+          if bad:
+              raise SystemExit(f"contract/contract.json does not report {want}: {bad}")
+          print(f"contract/contract.json reports {want}")
+          PYEOF
+
+      - name: Render CHANGELOG.md and release notes
+        if: steps.compute.outputs.should_release == 'true'
+        env:
+          LATEST_TAG: ${{ steps.compute.outputs.latest_tag }}
+          NEXT_VERSION: ${{ steps.compute.outputs.next_version }}
+        run: bash .github/scripts/render_changelog.sh
+
+      - name: Commit, tag, and push
+        if: steps.compute.outputs.should_release == 'true'
+        env:
+          NEXT_VERSION: ${{ steps.compute.outputs.next_version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml CHANGELOG.md contract/contract.json
+          if git diff --cached --quiet; then
+            echo "no file changes to commit for v${NEXT_VERSION} (changelog-only release notes still apply to the tag)"
           else
-            TAG="$REF_NAME"
+            git commit -m "chore(release): v${NEXT_VERSION}"
           fi
-          echo "TAG=$TAG" >> "$GITHUB_ENV"
-          if [ -z "$version" ] || [ "v$version" != "$TAG" ]; then
-            echo "::error::tag $TAG does not match the pyproject.toml version ($version)"
-            exit 1
-          fi
-          heading="$(grep -m1 -E "^## $(printf '%s' "$version" | sed 's/\./\\./g')( |$)" CHANGELOG.md || true)"
-          if [ -z "$heading" ]; then
-            echo "::error::CHANGELOG.md has no '## $version' section"
-            exit 1
-          fi
-          if printf '%s' "$heading" | grep -qi 'unreleased'; then
-            echo "::error::CHANGELOG.md still calls $version unreleased: date the section before tagging"
-            exit 1
-          fi
-          awk -v h="$heading" '
-            $0 == h { found = 1; next }
-            found && /^## / { exit }
-            found { print }
-          ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
-          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md"; then
-            echo "::error::the CHANGELOG.md section of $version is empty"
-            exit 1
-          fi
+          # An annotated tag, pushed by name: --follow-tags skips lightweight tags.
+          git tag -a "v${NEXT_VERSION}" -m "v${NEXT_VERSION}"
+          git push origin HEAD:main "refs/tags/v${NEXT_VERSION}"
 
       - name: Create the GitHub Release
+        if: steps.compute.outputs.should_release == 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
-          EVENT: ${{ github.event_name }}
-          SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "The release $TAG already exists: nothing to do."
-            exit 0
-          fi
-          if [ "$EVENT" = "workflow_dispatch" ]; then
-            if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null; then
-              gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
-            else
-              gh release create "$TAG" --target "$SHA" --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
-            fi
-          else
-            gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md"
-          fi
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NEXT_VERSION: ${{ steps.compute.outputs.next_version }}
+        run: gh release create "v${NEXT_VERSION}" --title "v${NEXT_VERSION}" --notes-file release_notes.md
