@@ -6,7 +6,7 @@ from typing import Any, Dict
 
 from . import PACKAGE_NAME, SKILL_ID, __version__
 from .doctor import DOCTOR_SCHEMA, IMPLEMENTED_OPS, OP_STEP
-from .engines import DEFAULT_ENGINE, engine_ids, get_engine
+from .engines import DEFAULT_ENGINE, OPT_IN_ENGINES, engine_ids, get_engine
 from .errors import ERROR_TABLE
 from .ffmpeg_skill import FLAGS_USED, OPTIONAL_FLAGS, SUPPORTED_CONTRACT_VERSION, TOOLS_USED
 from .engines.crosstalk import DEFAULTS as CROSSTALK_DEFAULTS, MAX_TRACKS, MIN_TRACKS
@@ -145,6 +145,7 @@ def contract() -> Dict[str, Any]:
         "long_inputs": BLOCKS,
         "engines": {"registered": {eid: get_engine(eid).spec() for eid in engine_ids()},
                     "default": dict(DEFAULT_ENGINE),
+                    "opt_in": sorted(OPT_IN_ENGINES),
                     "selection_adr": "docs/decisions.md ADR-001",
                     "optional": True,
                     "statuses": ["OK", "MISSING", "INCOMPATIBLE"]},

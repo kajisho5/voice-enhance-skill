@@ -338,7 +338,7 @@ def on_python_path(directory: str) -> Iterator[None]:
     way in and out, so a fake package is found by the engine's checks and by the worker, and forgotten afterwards."""
     import importlib
     def forget() -> None:
-        for name in [m for m in sys.modules if m == "nara_wpe" or m.startswith("nara_wpe.")]:
+        for name in [m for m in sys.modules if m.split(".")[0] in ("nara_wpe", "dpdfnet")]:
             del sys.modules[name]
         importlib.invalidate_caches()
     sys.path.insert(0, directory)
@@ -456,3 +456,88 @@ def energy_db(samples: List[float], rate: int, region: Tuple[float, float]) -> f
     """Energy of `samples` within `region` (seconds), in dB."""
     part = samples[int(region[0] * rate):int(region[1] * rate)]
     return 10 * math.log10(max(sum(v * v for v in part), 1e-20))
+
+
+# The fake `dpdfnet` package (the opt-in ISOLATE engine, ADR-015): dpdfnet/__init__.py with a StreamEnhancer of the
+# real one's interface, plus a dist-info so the engine's version check reads 0.6.0, and a stub onnxruntime module so
+# the engine's lookup finds it. The fake behaves like the real stream: it returns whole hops of 480 samples once a
+# 960-sample window has arrived, DELAY_SAMPLES (1920) late, and flush() returns at most one more hop. It records each
+# construction (model, onnx_path) to calls.json next to the package. Per mode:
+#   lowpass    the delayed stream is the input through a 2 kHz low-pass (the voice of the fixture is below 840 Hz, so
+#              the SNR of the voice+noise fixture rises, as with the fake deep-filter)
+#   identity   the delayed stream is the input unchanged (the engine must undo the delay sample for sample)
+#   fail       StreamEnhancer() raises RuntimeError
+FAKE_DPDFNET_PROGRAM = r'''
+import json, os
+import numpy as np
+MODE = __MODE__
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WIN, HOP, DELAY = 960, 480, 1920
+
+
+class StreamEnhancer:
+    def __init__(self, model="dpdfnet2", onnx_path=None, verbose=False):
+        path = os.path.join(HERE, "calls.json")
+        calls = json.load(open(path)) if os.path.exists(path) else []
+        calls.append({"model": model, "onnx_path": None if onnx_path is None else str(onnx_path)})
+        json.dump(calls, open(path, "w"))
+        if MODE == "fail":
+            raise RuntimeError("fake dpdfnet failed")
+        self.seen = np.zeros(0, dtype=np.float32)      # every input sample so far
+        self.out = 0                                     # samples returned so far
+        self.y1 = self.y2 = self.x1 = self.x2 = 0.0
+
+    def _filter(self, x):
+        if MODE == "identity":
+            return x
+        import math
+        w0 = 2 * math.pi * 2000.0 / 48000.0; al = math.sin(w0) / (2 * 0.7071067811865476); c = math.cos(w0); a0 = 1 + al
+        b0, b1, b2, a1, a2 = (1 - c) / 2 / a0, (1 - c) / a0, (1 - c) / 2 / a0, -2 * c / a0, (1 - al) / a0
+        y = np.empty_like(x)
+        for i, v in enumerate(x):
+            o = b0 * v + b1 * self.x1 + b2 * self.x2 - a1 * self.y1 - a2 * self.y2
+            self.x2, self.x1, self.y2, self.y1 = self.x1, float(v), self.y1, o
+            y[i] = o
+        return y
+
+    def process(self, chunk, sample_rate=None):
+        assert sample_rate in (None, 48000), sample_rate
+        self.seen = np.concatenate([self.seen, np.asarray(chunk, dtype=np.float32).reshape(-1)])
+        hops = 0 if len(self.seen) < WIN else (len(self.seen) - WIN) // HOP + 1
+        upto = hops * HOP
+        if upto <= self.out:
+            return np.zeros(0, dtype=np.float32)
+        stream = np.concatenate([np.zeros(DELAY, dtype=np.float32), self.seen])
+        piece = self._filter(stream[self.out:upto].astype(np.float64)).astype(np.float32)
+        self.out = upto
+        return piece
+
+    def flush(self):
+        return self.process(np.zeros(HOP, dtype=np.float32))[:HOP]
+'''
+
+
+def fake_dpdfnet(directory: str, mode: str = "lowpass", version: str = "0.6.0") -> str:
+    """A directory to put on sys.path / PYTHONPATH that holds the fake `dpdfnet` package and a stub `onnxruntime`."""
+    root = os.path.join(directory, "fake_dpdfnet_site")
+    pkg = os.path.join(root, "dpdfnet")
+    os.makedirs(pkg, exist_ok=True)
+    Path(pkg, "__init__.py").write_text(FAKE_DPDFNET_PROGRAM.replace("__MODE__", repr(mode)), encoding="utf-8")
+    ort = os.path.join(root, "onnxruntime")
+    os.makedirs(ort, exist_ok=True)
+    Path(ort, "__init__.py").write_text("", encoding="utf-8")
+    dist = os.path.join(root, f"dpdfnet-{version}.dist-info")
+    os.makedirs(dist, exist_ok=True)
+    Path(dist, "METADATA").write_text(f"Metadata-Version: 2.1\nName: dpdfnet\nVersion: {version}\n", encoding="utf-8")
+    return root
+
+
+def fake_dpdfnet_calls(site: str) -> List[Dict[str, Any]]:
+    path = Path(site, "calls.json")
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else []
+
+
+def fake_dpdfnet_model(directory: str, name: str = "dpdfnet2_48khz_hr.onnx") -> str:
+    path = os.path.join(directory, name)
+    Path(path).write_bytes(b"fake onnx model")
+    return path

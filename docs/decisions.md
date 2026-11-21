@@ -459,3 +459,47 @@ The 1.0 pull request carries the `major` label. release-drafter then resolves 0.
 - A caller that uses only section 1 of `bleed-reduce` can float across 1.x minors.
 - A caller of `isolate`, `dereverb`, `remux` or a section 2 part reads the CHANGELOG on each minor release. video-production-agent already asks for confirmation before every op (its ADR-073) and keeps doing so.
 - video-production-agent's re-pin sees a 0.x → 1.0.0 release with a `none` diff and widens its gate to `1.0.`.
+
+## ADR-015 DPDFNet as an opt-in second ISOLATE engine; DeepFilterNet3 stays the default
+
+Checked 2026-11-21 against the Hugging Face model repository `Ceva-IP/DPDFNet` (model card, file list at revision `dd6818d0`, 2026-07-05), the `dpdfnet` package on PyPI (0.6.0, 2026-07-05, its metadata and its source) and the ONNX file's own metadata.
+
+### Context
+
+- DeepFilterNet3 (ADR-001) works and its licence is clear, but `deepfilternet` on PyPI is still 0.5.6 (2023-08) and its code has had no change since 2024-10. A maintained second engine for `voice.isolate` gives a way out without changing the default before it has been compared on real recordings (roadmap step 10).
+- `voice.isolate` is `EXPERIMENTAL` (ADR-014), so a new engine is additive.
+- **DPDFNet** (CEVA) is DeepFilterNet2 with dual-path RNN blocks in the encoder: causal, single channel, real-time. Facts from the primary sources:
+  - Licence: Apache-2.0 for the weights (model card `license: apache-2.0`) and for the package (`License: Apache-2.0`, LICENSE file in the wheel).
+  - 48 kHz builds: `onnx/dpdfnet2_48khz_hr.onnx` (2.58 M parameters, 10,493,337 bytes) and `onnx/dpdfnet8_48khz_hr.onnx` (3.63 M, 14,857,107 bytes). The ONNX metadata of the first says `sample_rate` 48000, `n_fft` / `window_length` 960, `hop_length` 480, `window_type` vorbis. 8 and 16 kHz builds exist and are not used: the ISOLATE pipeline is 48 kHz (ADR-003).
+  - The package `dpdfnet` 0.6.0 runs the ONNX file on onnxruntime's CPU provider. It needs **Python >= 3.11** and depends on numpy, librosa, soundfile, onnxruntime, filelock and tqdm. A fresh virtual environment with it is about 600 MB.
+  - `dpdfnet.enhance()` and `dpdfnet.StreamEnhancer` take `onnx_path`. With it the package uses that file. Without it, the package looks in its cache and downloads the file from Hugging Face.
+  - `enhance()` holds the whole signal and its spectrum in memory (about 1.5 MB per second of 48 kHz audio). `StreamEnhancer` processes hop by hop and keeps the recurrent state between calls.
+
+### Decision
+
+- **Registered as `dpdfnet`, op `isolate`, opt-in.** `DEFAULT_ENGINE["isolate"]` stays `deepfilternet`. DPDFNet runs only with `voice-enhance isolate ... --engine dpdfnet`. `engines.OPT_IN_ENGINES` names it, and the contract lists it under `engines.opt_in`.
+- **Install is opt-in.** The extra `[dpdfnet]` (`dpdfnet>=0.6.0,<0.7`, numpy) is separate, and no other extra pulls it in. It has no environment marker. On Python < 3.11 the install fails to resolve rather than installing nothing silently, and `doctor` says the engine needs Python >= 3.11.
+- **The model is a file the user downloads once.** `$VOICE_ENHANCE_DPDFNET_MODEL` names `dpdfnet2_48khz_hr.onnx` (recommended) or `dpdfnet8_48khz_hr.onnx`. The engine passes it as `onnx_path`, so the package's cache and download code are never reached. Any other file name is `INCOMPATIBLE` before any media work. The result carries the file's SHA-256 (`engine.model_sha256`), so a run names the exact weights it used.
+- **Streaming, not whole-file.** The worker reads the prepared 48 kHz mono WAV in 10 s blocks and feeds `StreamEnhancer`, so memory stays bounded within one block of ADR-009 (default 600 s, up to 3600 s). The stream comes out 1920 samples (40 ms) late. This was measured on the real model by cross-correlation against `enhance()`, whose output the package aligns with its input. The engine drops those samples and feeds 1920 + 480 zeros at the end. The stem is sample-aligned with the input and exactly as long, unlike `deep-filter -D` (ADR-007), which ends 30 ms early.
+- **`--atten-lim-db`** keeps its meaning: out = a · input + (1 − a) · enhanced with a = 10^(−L/20), the mix the package applies offline. 100 (or none) means no limit, as for `deep-filter`.
+- **Output** is 32-bit float, 48 kHz mono, so nothing is clipped. The ISOLATE result shape (`voice-enhance/isolate@1`) does not change. `parameters.engine_argv` is `null` (no binary), and `compensate_delay` is `true`.
+- **doctor.** A missing opt-in engine is reported under `checks.engines` as before. It goes into the new `unavailable_opt_in_engines` list and is neither a problem nor a reason for `degraded`. An install that was `ok` before this release stays `ok`.
+- **Tests and CI.** Following the repository's pattern (a fake `deep-filter`, a fake `nara_wpe`), the unit and integration tests use a fake `dpdfnet` package. Like the real one, it returns whole hops 1920 samples late, and a stub `onnxruntime` comes with it. The real-engine tests (`test_real_dpdfnet_*`) skip unless the real package and model are installed. **No CI job downloads the DPDFNet model**, so the engines job allows exactly those skips and checks only the default engines for `OK`.
+
+### Verified (locally, not in CI)
+
+On a 4-core Intel Xeon at 2.1 GHz with Python 3.11, `dpdfnet` 0.6.0, onnxruntime 1.32.0 and `dpdfnet2_48khz_hr.onnx` (SHA-256 `7f0575a5…dc14b`), through the real ffmpeg-skill:
+
+| Fixture (synthetic voice + white noise, 30 s) | SNR in | SNR out | Realtime factor |
+|---|---|---|---|
+| 0 dB | 0.0 dB | 20.4 dB | 0.24 |
+| 10 dB | 10.0 dB | 26.1 dB | 0.24 |
+
+For comparison, ADR-007 recorded +18.2 dB for DeepFilterNet3 at 0 dB on the same kind of fixture (3 s). `test_real_dpdfnet_raises_snr`, `test_real_dpdfnet_is_sample_aligned` (lag 0, same length) and `test_real_dpdfnet_in_blocks` (40 s in four 15 s blocks) passed.
+
+### Consequences
+
+- Contract: additive. There is a new entry `engines.registered.dpdfnet` and a new field `engines.opt_in`. `doctor` gains `unavailable_opt_in_engines`. Tools, argv, result schemas and defaults are unchanged. A minor release.
+- `contract --json` lists the engine on every install. It is usable only after the extra and the model are installed.
+- Attribution "DPDFNet by CEVA, Apache-2.0" is in `provenance` of every run that uses it.
+- Whether DPDFNet becomes the default is decided only after roadmap step 10 compares both engines on real recordings. That change would be a separate ADR.

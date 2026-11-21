@@ -55,5 +55,8 @@ ffmpeg-skill `probe` (input facts, stem validation) and `audio` (stream extracti
 - [x] **14. 1.0.0: the compatibility promise** — `bleed_reduce` is `STABLE`; `isolate` and `dereverb` (third-party engines) and the newer opt-in parts (long inputs in blocks, `remux`) stay experimental (Velisa ADR-031 / D46) ([#26](https://github.com/kajisho5/voice-enhance-skill/pull/26), ADR-014)
   - Done when: the contract marks `voice.bleed_reduce` `STABLE` with a `none` contract diff, the README and an ADR state the promise, and 1.0.0 is released and re-pinned by the agent
 
+- [x] **15. DPDFNet as an opt-in second ISOLATE engine** — DPDFNet's 48 kHz ONNX build (`dpdfnet2_48khz_hr`, Apache-2.0, 10.5 MB) behind `--engine dpdfnet`; DeepFilterNet3 stays the default; installed with the `[dpdfnet]` extra only (ADR-015) (PR_LINK)
+  - Done when: `isolate --engine dpdfnet` runs it with the model file named by `VOICE_ENHANCE_DPDFNET_MODEL` (nothing downloaded at run time), the stem is sample-aligned and as long as the input, a missing opt-in engine does not degrade `doctor`, the unit tests use a fake `dpdfnet` package, no CI job downloads the model, and the release is a minor one. Whether it replaces DeepFilterNet3 as the default is decided only after step 10's real recordings
+
 ---
 Engine for every media operation: [ffmpeg-skill](https://github.com/kajisho5/ffmpeg-skill) (3.x, 42 tools, contract_version 2.0; treated as complete, proposals go to Velisa's ROADMAP). Orchestrator: [video-production-agent](https://github.com/kajisho5/video-production-agent).

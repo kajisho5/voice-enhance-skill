@@ -1,6 +1,7 @@
 """Engine registry. Only engines listed here can be selected or run by the worker; test engines are never
-registered. One engine per op today: DeepFilterNet3 for ISOLATE and nara_wpe for DEREVERB (ADR-001), and for
-BLEED_REDUCE the crosstalk signal-processing engine of this repository (ADR-005), since no AI engine fits that job."""
+registered. One default engine per op: DeepFilterNet3 for ISOLATE and nara_wpe for DEREVERB (ADR-001), and for
+BLEED_REDUCE the crosstalk signal-processing engine of this repository (ADR-005), since no AI engine fits that job.
+Opt-in engines run only when named with --engine and never count against doctor's status: DPDFNet for ISOLATE (ADR-015)."""
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Type
@@ -9,12 +10,15 @@ from ..errors import VoiceEnhanceError
 from .base import Engine
 from .crosstalk import CrosstalkEngine
 from .deepfilternet import DeepFilterNetEngine
+from .dpdfnet_engine import DpdfNetEngine
 from .nara_wpe_engine import NaraWpeEngine
 
 ENGINES: Dict[str, Type[Engine]] = {DeepFilterNetEngine.id: DeepFilterNetEngine, NaraWpeEngine.id: NaraWpeEngine,
-                                    CrosstalkEngine.id: CrosstalkEngine}
+                                    CrosstalkEngine.id: CrosstalkEngine, DpdfNetEngine.id: DpdfNetEngine}
 DEFAULT_ENGINE: Dict[str, Optional[str]] = {"isolate": DeepFilterNetEngine.id, "dereverb": NaraWpeEngine.id,
                                             "bleed_reduce": CrosstalkEngine.id}
+# Installed separately, selected only with --engine; a missing opt-in engine does not make doctor degraded (ADR-015).
+OPT_IN_ENGINES = frozenset({DpdfNetEngine.id})
 
 
 def engine_ids() -> List[str]:

@@ -22,6 +22,7 @@ AI voice isolation, dereverberation and mic-bleed reduction for recorded speech,
 | Op | Capability | Engine ([ADR-001](docs/decisions.md)) | Licence (code / weights) | Step |
 |---|---|---|---|---|
 | ISOLATE | `voice.isolate` | DeepFilterNet3 via the standalone `deep-filter` binary (no PyTorch) | MIT OR Apache-2.0 / same | 3 (done) |
+| ISOLATE, opt-in | `voice.isolate` | `--engine dpdfnet`: DPDFNet's 48 kHz ONNX build (`dpdfnet2_48khz_hr`, 10.5 MB) on onnxruntime, not the default ([ADR-015](docs/decisions.md)) | Apache-2.0 / Apache-2.0 | 15 (done) |
 | DEREVERB | `voice.dereverb` | nara_wpe (WPE, signal processing) | MIT / no weights | 4 (done) |
 | BLEED_REDUCE | `voice.bleed_reduce` | `crosstalk`: this repository's linear cross-talk demixing on NumPy, no AI model ([ADR-005](docs/decisions.md)) | MIT / no weights | 5 (done) |
 
@@ -57,7 +58,7 @@ From 1.0.0, a breaking change to anything below ships only in a major release (2
   - `voice.isolate`, which runs the DeepFilterNet3 model through the third-party `deep-filter` binary;
   - `voice.dereverb`, which runs the third-party `nara_wpe` package (0.0.x);
   - in `bleed-reduce`: long inputs in blocks (`--block-seconds`, `--cache-dir`, the `blocks` and `timing` result sections, and the contract's top-level `long_inputs` field), the text of `warnings`, and the default value of `--dominance-db`, which real recordings may retune (roadmap step 10);
-  - `remux` and `engines`, and the `deepfilternet` and `nara_wpe` entries of `engines`.
+  - `remux` and `engines`, and the `deepfilternet`, `dpdfnet` and `nara_wpe` entries of `engines`.
 - The promise is about the interface, not the sound. Every op is measured on synthetic fixtures only, so listen to the result.
 - **Deprecation:** a `STABLE` entry or option is marked `DEPRECATED` in a minor release, with its replacement named. It keeps working for at least one more minor release and 30 days, and is removed only in a major release.
 
@@ -92,6 +93,7 @@ Each track is written to `<out_dir>/<input name>_a<stream>.wav` as mono 32-bit f
 ## Engines (optional)
 
 - **DeepFilterNet3** (ISOLATE): download `deep-filter` for your platform from the [DeepFilterNet releases](https://github.com/Rikorose/DeepFilterNet/releases) (v0.5.x, for example `deep-filter-0.5.6-x86_64-unknown-linux-musl`), and [`DeepFilterNet3_onnx.tar.gz`](https://github.com/Rikorose/DeepFilterNet/raw/v0.5.6/models/DeepFilterNet3_onnx.tar.gz) from the repository's `models/` directory (it is not a release asset). Put `deep-filter` on `PATH` (or set `VOICE_ENHANCE_DEEP_FILTER`) and set `VOICE_ENHANCE_DFN_MODEL` to the model tarball. With `-D` the stem is sample-aligned and 30 ms shorter than its input, at the end ([ADR-007](docs/decisions.md)).
+- **DPDFNet** (ISOLATE, opt-in, [ADR-015](docs/decisions.md)): runs only with `voice-enhance isolate ... --engine dpdfnet`; DeepFilterNet3 stays the default. `pip install -e '.[dpdfnet]'` (the `dpdfnet` package 0.6.x with onnxruntime, librosa and soundfile: Python >= 3.11, about 600 MB in a fresh environment). Then download [`dpdfnet2_48khz_hr.onnx`](https://huggingface.co/Ceva-IP/DPDFNet/resolve/main/onnx/dpdfnet2_48khz_hr.onnx) (10.5 MB, Apache-2.0; `dpdfnet8_48khz_hr.onnx`, 14.9 MB, also works) and set `VOICE_ENHANCE_DPDFNET_MODEL` to it. The skill passes that file to the package, so the package never downloads a model itself. The stem is a 48 kHz mono 32-bit float WAV, sample-aligned with its input and exactly as long. `--atten-lim-db` works as for DeepFilterNet3. Not installed, it is listed by `doctor` under `unavailable_opt_in_engines` and does not make the status `degraded`.
 - **nara_wpe** (DEREVERB): `pip install -e '.[wpe]'`.
 - **crosstalk** (BLEED_REDUCE): part of this package; it needs NumPy, `pip install -e '.[bleed]'`.
 

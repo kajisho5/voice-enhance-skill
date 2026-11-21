@@ -18,6 +18,10 @@ dependencies = []
 wpe = ["nara_wpe>=0.0.11,<0.1", "numpy>=1.21"]
 # BLEED_REDUCE engine (ADR-005): this repository's own signal processing on NumPy, no model weights.
 bleed = ["numpy>=1.21"]
+# Opt-in second ISOLATE engine (ADR-015): DPDFNet's 48 kHz ONNX build on onnxruntime. Not the default and not installed
+# by the extras above. The dpdfnet package needs Python >= 3.11 and pulls in onnxruntime, librosa and soundfile (about
+# 600 MB in a fresh environment). The model file (10.5 MB) is downloaded once by hand; doctor says how.
+dpdfnet = ["dpdfnet>=0.6.0,<0.7", "numpy>=1.21"]
 
 [project.scripts]
 voice-enhance = "voice_enhance_skill.cli:main"
