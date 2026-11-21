@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.0 - 2026-11-21
+
+- feat(isolate): DPDFNet 48 kHz as an opt-in second engine; DeepFilterNet3 stays the default (#28) (81f68c7)
+- docs(readme): long_inputs is an exception to the covered top-level contract fields (ADR-014) (#27) (e38b8de)
+
 ## 1.0.0 - 2026-11-21
 
 - feat!: 1.0.0 - bleed-reduce is STABLE; isolate and dereverb stay EXPERIMENTAL (ADR-014) (#26) (b2647c5)
