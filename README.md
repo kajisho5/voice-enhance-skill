@@ -52,11 +52,11 @@ From 1.0.0, a breaking change to anything below ships only in a major release (2
   - the inputs (2-8 time-aligned tracks, `--audio-streams`) and the options `--engine crosstalk`, `--dominance-db`, `--timeout`, `--overwrite`, `--ffmpeg-skill` and `--offline`;
   - the outputs: one mono 32-bit float WAV per track, `<out_dir>/<input name>_a<stream>.wav`, sample-aligned with its input;
   - the result `voice-enhance/bleed-reduce@1`, `parameters.coupling_db` and the provenance block;
-  - `contract --json` and `doctor --json` (`voice-enhance/doctor@1`), the error codes and exit codes, and the top-level contract fields.
+  - `contract --json` and `doctor --json` (`voice-enhance/doctor@1`), the error codes and exit codes, and the top-level contract fields except `long_inputs`.
 - **Still experimental**, and these may change in a minor release with a CHANGELOG line:
   - `voice.isolate`, which runs the DeepFilterNet3 model through the third-party `deep-filter` binary;
   - `voice.dereverb`, which runs the third-party `nara_wpe` package (0.0.x);
-  - in `bleed-reduce`: long inputs in blocks (`--block-seconds`, `--cache-dir`, the `blocks` and `timing` result sections), the text of `warnings`, and the default value of `--dominance-db`, which real recordings may retune (roadmap step 10);
+  - in `bleed-reduce`: long inputs in blocks (`--block-seconds`, `--cache-dir`, the `blocks` and `timing` result sections, and the contract's top-level `long_inputs` field), the text of `warnings`, and the default value of `--dominance-db`, which real recordings may retune (roadmap step 10);
   - `remux` and `engines`, and the `deepfilternet` and `nara_wpe` entries of `engines`.
 - The promise is about the interface, not the sound. Every op is measured on synthetic fixtures only, so listen to the result.
 - **Deprecation:** a `STABLE` entry or option is marked `DEPRECATED` in a minor release, with its replacement named. It keeps working for at least one more minor release and 30 days, and is removed only in a major release.
