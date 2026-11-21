@@ -52,5 +52,8 @@ ffmpeg-skill `probe` (input facts, stem validation) and `audio` (stream extracti
   - Done when: `contract --json` no longer names sound-design-skill for separation, and SKILL.md says the same
   - Done ([#19](https://github.com/kajisho5/voice-enhance-skill/pull/19)): `not_provided` now lists "music / BGM generation (sound-design-skill)" and "music / BGM separation (provided by no skill; a new owner needs an ADR first)"; SKILL.md's "Not this skill's job" says the same; `test_music_separation_names_no_owner` checks the contract. Separation is not implemented
 
+- [x] **14. 1.0.0: the compatibility promise** — `bleed_reduce` is `STABLE`; `isolate` and `dereverb` (third-party engines) and the newer opt-in parts (long inputs in blocks, `remux`) stay experimental (Velisa ADR-031 / D46) ([#26](https://github.com/kajisho5/voice-enhance-skill/pull/26), ADR-014)
+  - Done when: the contract marks `voice.bleed_reduce` `STABLE` with a `none` contract diff, the README and an ADR state the promise, and 1.0.0 is released and re-pinned by the agent
+
 ---
 Engine for every media operation: [ffmpeg-skill](https://github.com/kajisho5/ffmpeg-skill) (3.x, 42 tools, contract_version 2.0; treated as complete, proposals go to Velisa's ROADMAP). Orchestrator: [video-production-agent](https://github.com/kajisho5/video-production-agent).

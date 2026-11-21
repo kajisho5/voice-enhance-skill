@@ -17,7 +17,7 @@
 
 AI voice isolation, dereverberation and mic-bleed reduction for recorded speech, for the [AI Video Production OS](https://github.com/kajisho5/AI-video-production-OS) (department 音 / Audio). Local and offline: engines are optional, never downloaded by the skill, and every media step (probe, format conversion, putting the cleaned audio back into the video) goes through [ffmpeg-skill](https://github.com/kajisho5/ffmpeg-skill).
 
-**Status: 0.1.0, unreleased.** `isolate` ([ADR-003](docs/decisions.md)), `dereverb` ([ADR-004](docs/decisions.md)) and `bleed-reduce` ([ADR-005](docs/decisions.md)) work (`EXPERIMENTAL`). `remux` puts a cleaned stem back into its video ([ADR-006](docs/decisions.md)). `contract`, `doctor` and `engines` work. [SKILL.md](SKILL.md) is the agent-facing summary, and CI runs the real engines on Linux ([ADR-007](docs/decisions.md)). Next on the [roadmap](ECOSYSTEM_ROADMAP.md): step 8, the agent adapter (video-production-agent).
+**Status: 1.0.** `isolate` ([ADR-003](docs/decisions.md)), `dereverb` ([ADR-004](docs/decisions.md)) and `bleed-reduce` ([ADR-005](docs/decisions.md)) work. `bleed-reduce` is `STABLE`; `isolate` and `dereverb` are `EXPERIMENTAL` (see [Compatibility promise (1.0)](#compatibility-promise-10)). `remux` puts a cleaned stem back into its video ([ADR-006](docs/decisions.md)). `contract`, `doctor` and `engines` work. [SKILL.md](SKILL.md) is the agent-facing summary, and CI runs the real engines on Linux ([ADR-007](docs/decisions.md)). video-production-agent calls the three ops (its ADR-073). Open on the [roadmap](ECOSYSTEM_ROADMAP.md): step 10, measurement on real venue recordings.
 
 | Op | Capability | Engine ([ADR-001](docs/decisions.md)) | Licence (code / weights) | Step |
 |---|---|---|---|---|
@@ -43,6 +43,23 @@ voice-enhance remux panel.mkv clean/panel_a0.wav -o panel_a0.mkv --drop-other-au
 ```
 
 `contract/contract.json` is the contract committed as a file (`voice-enhance contract --json` as one line with sorted keys, compact separators and a final newline), so the contract of any commit or tag is `git show <ref>:contract/contract.json`, with nothing installed or run. Regenerate it with `python contract/generate.py`; a unit test fails when it is stale.
+
+## Compatibility promise (1.0)
+
+From 1.0.0, a breaking change to anything below ships only in a major release (2.0.0), per Velisa ADR-031 ([ADR-014](docs/decisions.md)):
+
+- **`STABLE`:** `voice.bleed_reduce` (`bleed-reduce`), with these parts:
+  - the inputs (2-8 time-aligned tracks, `--audio-streams`) and the options `--engine crosstalk`, `--dominance-db`, `--timeout`, `--overwrite`, `--ffmpeg-skill` and `--offline`;
+  - the outputs: one mono 32-bit float WAV per track, `<out_dir>/<input name>_a<stream>.wav`, sample-aligned with its input;
+  - the result `voice-enhance/bleed-reduce@1`, `parameters.coupling_db` and the provenance block;
+  - `contract --json` and `doctor --json` (`voice-enhance/doctor@1`), the error codes and exit codes, and the top-level contract fields.
+- **Still experimental**, and these may change in a minor release with a CHANGELOG line:
+  - `voice.isolate`, which runs the DeepFilterNet3 model through the third-party `deep-filter` binary;
+  - `voice.dereverb`, which runs the third-party `nara_wpe` package (0.0.x);
+  - in `bleed-reduce`: long inputs in blocks (`--block-seconds`, `--cache-dir`, the `blocks` and `timing` result sections), the text of `warnings`, and the default value of `--dominance-db`, which real recordings may retune (roadmap step 10);
+  - `remux` and `engines`, and the `deepfilternet` and `nara_wpe` entries of `engines`.
+- The promise is about the interface, not the sound. Every op is measured on synthetic fixtures only, so listen to the result.
+- **Deprecation:** a `STABLE` entry or option is marked `DEPRECATED` in a minor release, with its replacement named. It keeps working for at least one more minor release and 30 days, and is removed only in a major release.
 
 ## isolate
 
