@@ -26,6 +26,13 @@ BLOCKS = {"default_block_seconds": BLOCK_SECONDS, "block_seconds_range": list(BL
                                 "resumed_from", "cache_dir"],
                      "timing": ["engine", "engine_seconds", "audio_seconds", "realtime_factor", "engine_seconds_this_run"]}}
 CAPABILITY_IDS = {"isolate": "voice.isolate", "dereverb": "voice.dereverb", "bleed_reduce": "voice.bleed_reduce"}
+# The 1.0 compatibility promise (docs/decisions.md ADR-014, Velisa ADR-031): a STABLE entry, and the tool it maps to, changes in
+# a breaking way only in a major release. bleed_reduce runs this repository's own signal processing (the crosstalk engine, NumPy,
+# no weights) and is STABLE. isolate (the DeepFilterNet3 model through the third-party deep-filter binary) and dereverb (the
+# third-party nara_wpe 0.0.x package) stay EXPERIMENTAL. The newer opt-in parts of the STABLE tool that the ADR lists (long
+# inputs in blocks: --block-seconds, --cache-dir, the `blocks` and `timing` result sections) stay experimental too; a
+# parameter has no lifecycle field, so the ADR and the README say which.
+STABLE_OPERATIONS = frozenset({"bleed_reduce"})
 _OP_TOOLS = {
     "isolate": {"description": "Voice stem of a recording with noise and background removed (AI, DeepFilterNet3)",
                 "argv": ["isolate", "<media>", "-o <out.wav>", "[--audio-stream 0]", "[--engine deepfilternet]",
@@ -98,6 +105,12 @@ def tools() -> list:
     return out
 
 
+def _lifecycle(op: str) -> str:
+    if not IMPLEMENTED_OPS[op]:
+        return "PROPOSED"
+    return "STABLE" if op in STABLE_OPERATIONS else "EXPERIMENTAL"
+
+
 def contract() -> Dict[str, Any]:
     # Skill dependencies only (other Skills this one invokes), each with skill_id and version_range: the OS contract shape
     # (Velisa registry/capability_contract.schema.json, ADR-018). The engines are not Skills: each one's version range,
@@ -118,7 +131,7 @@ def contract() -> Dict[str, Any]:
         "skill": {"id": SKILL_ID, "package": PACKAGE_NAME, "version": __version__},
         "version": __version__,
         "contract_version": CONTRACT_VERSION,
-        "provides": [{"id": CAPABILITY_IDS[op], "lifecycle": "EXPERIMENTAL" if IMPLEMENTED_OPS[op] else "PROPOSED",
+        "provides": [{"id": CAPABILITY_IDS[op], "lifecycle": _lifecycle(op),
                       "tool_id": f"{SKILL_ID}/{op.replace('_', '-')}"} for op in CAPABILITY_IDS],
         "dependencies": deps,
         "not_provided": ["traditional (non-AI) noise reduction, gain, loudness, mixing, silence and filler removal (audio-production-skill)",

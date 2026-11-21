@@ -386,3 +386,76 @@ Today's release commits wrote CHANGELOG.md headings as `## vX.Y.Z - date`. Every
 
 - A version bumped by hand in a pull request is released whatever its labels.
 - A release that fails the tests is not made; a later push retries.
+
+## ADR-014 The 1.0 compatibility promise: `bleed_reduce` is STABLE; `isolate` and `dereverb` stay EXPERIMENTAL
+
+2026-11-21. Status: Accepted (Velisa ADR-031 / D46; the owner approved the 1.0 transition).
+
+### Context
+
+Velisa ADR-031 sets what 1.0 means for a Skill. From 1.0.0, a change that `si contract-diff` calls breaking, to a part of the contract the promise covers, ships only in a major release. The promise covers the `provides[]` entries marked `STABLE` and the tools they map to, their request, response and error shapes, and the top-level contract fields that are not tied to a capability. An `EXPERIMENTAL` entry may still change in a minor release, with a CHANGELOG line.
+
+ADR-031's readiness measurements for this repository, checked again on 2026-11-21:
+
+- **Breaking changes:** none in the tag diffs (v0.1.1 to v0.1.3 commit `contract/contract.json`) or in the labels of the merged pull requests.
+- **Open roadmap steps:** only step 10, measurement on real venue recordings. It is a field test: it measures the ops and changes no command, option or output. Step 9 (ffmpeg-skill 3.0.0) is done (#11).
+- **Known defects:** none. There is no open issue and no open pull request.
+- **Releases:** four (v0.1.0 to v0.1.3; criterion 4 asks for five). 1.0.0 is the fifth. The three ops shipped in v0.1.0 (2026-11-13) and none of their commands, options or result schemas has changed since.
+- **Agent:** video-production-agent pins this contract and calls `isolate`, `dereverb` and `bleed-reduce` (its ADR-073), plus `contract --json` and `doctor --json`. It does not call `remux` or `engines`.
+
+The contract has a `lifecycle` field only on `provides[]` entries: `voice.isolate`, `voice.dereverb` and `voice.bleed_reduce`. A parameter, and a tool without a `provides[]` entry (`remux`, `doctor`, `engines`, `contract`), has none, so ADR-031 sections 2 and 3 record their status in text: the README, the CHANGELOG and this ADR.
+
+### Decision
+
+#### 1. `STABLE` entry
+
+- **`voice.bleed_reduce`** (`voice-enhance/bleed-reduce`). It covers:
+  - the inputs: 2-8 time-aligned tracks, the audio streams of one file or one stream per file, `--audio-streams`;
+  - `--engine crosstalk`, `--dominance-db`, `--timeout`, `--overwrite`, `--ffmpeg-skill` and `--offline`;
+  - the outputs: one mono 32-bit float WAV per track, `<out_dir>/<input name>_a<stream>.wav`, sample-aligned with its input, at the first track's rate; a new output directory placed whole;
+  - the result `voice-enhance/bleed-reduce@1` with its keys, `parameters.coupling_db` (a matrix in dB, `null` for a pair that could not be measured) and the provenance block;
+  - the refusals: mixed rates without ffmpeg-skill `audio --sample-rate` (`FFMPEG_SKILL_UNAVAILABLE`), and the error codes and exit codes.
+
+  The engine is this repository's own code: linear demixing per frequency on NumPy, with no model and no weights (ADR-005). It runs locally, is deterministic, and depends on nothing outside this repository but NumPy and ffmpeg-skill's `probe` and `audio`, which are checked flag by flag. Its behaviour is therefore under this repository's control, which is what a promise needs.
+
+  The promise is about the interface, not the sound. The ops are measured on synthetic fixtures only (roadmap step 10 is open). The default of `--dominance-db` (3) may be retuned in a minor release with a CHANGELOG line when step 10 measures real recordings. The option, its range and the output shape stay.
+
+#### 2. Experimental parts of the `STABLE` tool
+
+These may still change in a minor release, with a CHANGELOG line:
+
+- **Long inputs in blocks** (ADR-009, roadmap step 11): `--block-seconds`, `--cache-dir`, the cache layout, and the result's `blocks` and `timing` sections (the contract's `long_inputs`). It is the newest part of the op, and it has not run on a real multi-hour recording. An input no longer than one block runs exactly as without it.
+- The text of `warnings`. Callers read and pass the entries on; they do not match on them.
+
+A request that uses none of these gets the `STABLE` behaviour of section 1.
+
+#### 3. `EXPERIMENTAL` entries
+
+- **`voice.isolate`** (`voice-enhance/isolate`). It runs the DeepFilterNet3 model through the third-party `deep-filter` binary (range `>=0.5.0 <0.6.0`), with weights that are not part of this repository. The output depends on the model. Its 48 kHz rule and the 30 ms short stem come from the binary (ADR-007). A new model or binary release can change the input rules, the parameters (`--atten-lim-db`) or the output, and this repository does not control that.
+- **`voice.dereverb`** (`voice-enhance/dereverb`). WPE has no weights, but it runs through the third-party `nara_wpe` package, still 0.0.x (range `>=0.0.11 <0.1.0`). Its parameters (`--taps`, `--delay`, `--iterations`) are that package's. The real `wpe_v8` diverged on dual mono, and the channel handling (`parameters.independent_channels`) was reworked for it shortly before 0.1.0 (ADR-007). Step 10 may still reshape the parameters.
+
+Each can be promoted in a later release once step 10 has measured it on real recordings and its engine range has held. Promotion is metadata only (si's `lifecycle-promoted` rule).
+
+#### 4. Tools without a `provides[]` entry
+
+- **Covered:** `voice-enhance contract --json` (the contract document) and `voice-enhance doctor --json` (`voice-enhance/doctor@1`: `ok`, `status`, the check names and the engine statuses `OK` / `MISSING` / `INCOMPATIBLE`). The agent locates and checks this Skill through them. The rows and install lines of the experimental engines follow those engines.
+- **Not covered, experimental:** `remux` (ADR-006) and `engines`. `remux` is a helper the agent does not call; what it can keep depends on ffmpeg-skill `audio --replace`, another Skill's behaviour.
+- **Top-level fields:** `errors` (codes, exit codes, retryable), `error_shape`, `execution`, `provenance.fields`, `not_provided`, `dependencies` and `skill` are covered. In `engines`, the shape and the `crosstalk` entry are covered. The `deepfilternet` and `nara_wpe` entries (version ranges, install lines, locations) follow the experimental ops. `long_inputs` follows section 2.
+
+#### 5. How the promise is kept
+
+- **Deprecation** of a `STABLE` entry or a covered option (ADR-031 section 3):
+  1. mark it `DEPRECATED` in a minor release, naming its replacement in the README and the CHANGELOG;
+  2. keep it working for at least one more minor release and 30 days;
+  3. remove it only in the next major release.
+- **Breaking-change review.** This repository has no contract-diff caller yet (Velisa D36), so there is no `contract:breaking` label to check. The reviewer of a pull request that changes `contract/contract.json` runs `si contract-diff` on the old and new files. A breaking item in `voice.bleed_reduce`, `contract`, `doctor` or a covered top-level field needs the `major` label (`major-label-check.yml` enforces it once contract-diff labels pull requests). si reports an option of the `STABLE` tool as part of that tool, so a break in a section 2 part counts as a break of `bleed-reduce` unless the pull request and the CHANGELOG entry name it as that part.
+
+#### 6. Release
+
+The 1.0 pull request carries the `major` label. release-drafter then resolves 0.1.3 → 1.0.0. `release_gate.py` treats `major` as release-level. No workflow changes. The contract diff of the pull request is `none` (one `lifecycle-promoted` item). `contract_version` stays `1.0`: it is a separate axis from the release version.
+
+### Consequences
+
+- A caller that uses only section 1 of `bleed-reduce` can float across 1.x minors.
+- A caller of `isolate`, `dereverb`, `remux` or a section 2 part reads the CHANGELOG on each minor release. video-production-agent already asks for confirmation before every op (its ADR-073) and keeps doing so.
+- video-production-agent's re-pin sees a 0.x → 1.0.0 release with a `none` diff and widens its gate to `1.0.`.

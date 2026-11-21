@@ -116,8 +116,9 @@ class ContractTests(unittest.TestCase):
         for p in c["provides"]:
             self.assertEqual(set(p), {"id", "lifecycle", "tool_id"})
             self.assertIn(p["tool_id"], tool_ids)
-            # ISOLATE (step 3, ADR-003), DEREVERB (step 4, ADR-004) and BLEED_REDUCE (step 5, ADR-005) are implemented
-            self.assertEqual(p["lifecycle"], "EXPERIMENTAL", p)
+            # ISOLATE (step 3, ADR-003), DEREVERB (step 4, ADR-004) and BLEED_REDUCE (step 5, ADR-005) are implemented;
+            # the 1.0 promise (ADR-014) makes BLEED_REDUCE STABLE
+            self.assertIn(p["lifecycle"], ("EXPERIMENTAL", "STABLE"), p)
         for d in c["dependencies"]:
             self.assertIsInstance(d["version_range"], str)
             self.assertFalse(d["version_range"].replace(".", "").isdigit(), d)
@@ -128,6 +129,27 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(c["skill"], {"id": SKILL_ID, "package": "voice-enhance-skill", "version": __version__})
         self.assertFalse(c["execution"]["network"])
         json.dumps(c, allow_nan=False)
+
+
+    def test_provides_lifecycle_is_the_1_0_promise(self):
+        """docs/decisions.md ADR-014: bleed_reduce (this repository's own signal processing, no weights) is STABLE; isolate
+        (the DeepFilterNet3 model) and dereverb (the third-party nara_wpe 0.0.x package) stay EXPERIMENTAL. Promoting an
+        entry is metadata only (si's `lifecycle-promoted` rule), so the ids, tool ids and their order are unchanged."""
+        from voice_enhance_skill.contract import STABLE_OPERATIONS
+        c = contract()
+        self.assertEqual(c["provides"], [
+            {"id": "voice.isolate", "lifecycle": "EXPERIMENTAL", "tool_id": "voice-enhance/isolate"},
+            {"id": "voice.dereverb", "lifecycle": "EXPERIMENTAL", "tool_id": "voice-enhance/dereverb"},
+            {"id": "voice.bleed_reduce", "lifecycle": "STABLE", "tool_id": "voice-enhance/bleed-reduce"},
+        ])
+        self.assertLessEqual(STABLE_OPERATIONS, set(CAPABILITY_IDS))
+        # a STABLE op runs an engine of this repository's own: no model weights, no third-party engine binary or package
+        engines = c["engines"]["registered"]
+        for op in STABLE_OPERATIONS:
+            eng = engines[c["engines"]["default"][op]]
+            self.assertTrue(eng["weights_license"].startswith("none"), eng)
+            self.assertEqual(eng["code_license"], "MIT (this repository)", eng)
+            self.assertEqual((eng["execution_mode"], eng["network_required"], eng["deterministic"]), ("local", False, True), eng)
 
     def test_music_separation_names_no_owner(self):
         # roadmap step 13: sound-design-skill generates music, it does not separate it; no skill owns separation
