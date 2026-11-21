@@ -80,7 +80,8 @@ jobs:
     # Linux only, the real engines (ADR-007): deep-filter 0.5.6, the static musl binary of the DeepFilterNet release,
     # with DeepFilterNet3_onnx.tar.gz from models/ at the same tag (it is not a release asset), both checked against a
     # pinned SHA-256; nara_wpe 0.0.11 from PyPI through `.[wpe]`. No PyTorch anywhere. The real-engine tests that skip
-    # in every other job must run and pass here: the only skip allowed is the unit test that needs nara_wpe absent.
+    # in every other job must run and pass here: the only skips allowed are the unit test that needs nara_wpe absent and
+    # the real-DPDFNet tests (opt-in engine, its model is never downloaded in CI: ADR-015).
     runs-on: ubuntu-24.04
     env:
       DFN_VERSION: "0.5.6"
@@ -119,10 +120,12 @@ jobs:
           deep-filter --version
           deep-filter --help
       - run: python -m pip install -e '.[wpe,bleed]' && python -m pip list
-      - name: doctor reports every engine OK
+      # The opt-in DPDFNet engine (ADR-015) is not installed here: no CI job downloads its model. It is MISSING, listed
+      # under unavailable_opt_in_engines, and must not make the status degraded.
+      - name: doctor reports every default engine OK
         run: |
           voice-enhance doctor --json --ffmpeg-skill vendor/ffmpeg-skill | tee doctor.json
-          python -c "import json; d=json.load(open('doctor.json')); e=d['checks']['engines']; assert all(v['status']=='OK' for v in e.values()), e; assert d['status']=='ok', d['problems']"
+          python -c "import json; d=json.load(open('doctor.json')); e=d['checks']['engines']; assert all(e[k]['status']=='OK' for k in ('deepfilternet','nara_wpe','crosstalk')), e; assert d['unavailable_opt_in_engines']==['dpdfnet'], d; assert d['status']=='ok', d['problems']"
       - name: All tests run, the real-engine ones included
         env:
           VOICE_ENHANCE_FFMPEG_SKILL_DIR: ${{ github.workspace }}/vendor/ffmpeg-skill
@@ -130,7 +133,7 @@ jobs:
         run: |
           set -o pipefail
           python -m unittest discover -s tests -v 2>&1 | tee test.log
-          ! grep -E "\.\.\. skipped" test.log | grep -v "skipped 'nara_wpe is installed'"
+          ! grep -E "\.\.\. skipped" test.log | grep -v -e "skipped 'nara_wpe is installed'" -e "skipped 'the real dpdfnet package"
           for t in test_real_deep_filter_cli_flags test_real_deep_filter_raises_snr test_real_deep_filter_is_sample_aligned \
                    test_real_nara_wpe_raises_srr test_real_nara_wpe_dual_mono test_real_nara_wpe_distinct_stereo \
                    test_real_deep_filter_in_blocks; do

@@ -39,6 +39,15 @@ def real_engine_ok() -> bool:
     return get_engine("deepfilternet").inspect()["status"] == "OK"
 
 
+NO_REAL_DPDFNET = ("the real dpdfnet package and a 48 kHz DPDFNet ONNX model are not installed (opt-in engine: no CI job "
+                   "downloads its model, ADR-015)")
+REAL_DPDFNET_MIN_GAIN_DB = 6.0       # ADR-015 records what was measured locally
+
+
+def real_dpdfnet_ok() -> bool:
+    return get_engine("dpdfnet").inspect()["status"] == "OK"
+
+
 def real_wpe_ok() -> bool:
     return get_engine("nara_wpe").inspect()["status"] == "OK"
 
@@ -207,6 +216,42 @@ class IsolateIntegrationTests(unittest.TestCase):
         self.assertLessEqual(len(clean) - len(stem), 1920)
         before, after = snr_db(clean, read_wav(src)[2]), snr_db(clean, stem)
         self.assertGreater(after, before + REAL_ISOLATE_MIN_GAIN_DB, (before, after))
+
+    @unittest.skipUnless(real_dpdfnet_ok(), NO_REAL_DPDFNET)
+    def test_real_dpdfnet_raises_snr(self):
+        # The opt-in engine (ADR-015), selected with engine="dpdfnet"; the default stays deepfilternet.
+        src = os.path.join(self.tmp, "noisy.wav")
+        clean = voice_noise_fixture(src, seconds=3.0, snr_db=0.0)
+        out = os.path.join(self.tmp, "voice.wav")
+        doc = isolate(IsolateRequest(src, out, engine="dpdfnet"), skill=self.skill)
+        self.assertEqual(doc["engine"]["id"], "dpdfnet")
+        self.assertIn(doc["engine"]["model"], ("dpdfnet2_48khz_hr.onnx", "dpdfnet8_48khz_hr.onnx"))
+        before, after = snr_db(clean, read_wav(src)[2]), snr_db(clean, read_wav(out)[2])
+        self.assertGreater(after, before + REAL_DPDFNET_MIN_GAIN_DB, (before, after))
+
+    @unittest.skipUnless(real_dpdfnet_ok(), NO_REAL_DPDFNET)
+    def test_real_dpdfnet_is_sample_aligned(self):
+        # The engine drops the stream's 1920-sample delay: the stem lines up with the clean voice at lag 0 and is
+        # exactly as long as the input. An uncompensated delay of 1920 samples would show as a lag of -98 (mod 343).
+        src = os.path.join(self.tmp, "noisy.wav")
+        clean = voice_noise_fixture(src, seconds=2.0, snr_db=10.0)
+        out = os.path.join(self.tmp, "voice.wav")
+        isolate(IsolateRequest(src, out, engine="dpdfnet"), skill=self.skill)
+        rate, _, stem = read_wav(out)
+        self.assertEqual((rate, len(stem)), (48000, len(clean)))
+        self.assertEqual(best_lag(clean, stem, start=48000, length=12000, max_lag=160), 0)
+
+    @unittest.skipUnless(real_dpdfnet_ok(), NO_REAL_DPDFNET)
+    def test_real_dpdfnet_in_blocks(self):
+        src = os.path.join(self.tmp, "noisy.wav")
+        clean = voice_noise_fixture(src, seconds=40.0, snr_db=0.0)
+        out = os.path.join(self.tmp, "voice.wav")
+        doc = isolate(IsolateRequest(src, out, engine="dpdfnet", block_seconds=15.0), skill=self.skill)
+        self.assertEqual((doc["blocks"]["count"], doc["blocks"]["processed"]), (4, [0, 1, 2, 3]))
+        stem = read_wav(out)[2]
+        self.assertEqual(len(stem), len(clean))
+        before, after = snr_db(clean, read_wav(src)[2]), snr_db(clean, stem)
+        self.assertGreater(after, before + REAL_DPDFNET_MIN_GAIN_DB, (before, after))
 
 
 @unittest.skipUnless(FFMPEG_SKILL_DIR and HAVE_FFMPEG, "needs an ffmpeg-skill checkout and ffmpeg/ffprobe on PATH")

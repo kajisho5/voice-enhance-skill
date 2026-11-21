@@ -2,8 +2,9 @@
 engine (only looks it up), so it is fast and safe to run anywhere. Media capabilities are detected through
 ffmpeg-skill (its contract and its own doctor); this skill runs no ffmpeg itself.
 
-status: ok (ffmpeg-skill usable, every engine OK) | degraded (an engine MISSING / INCOMPATIBLE) | fail (Python or
-ffmpeg-skill not usable). Each op reports whether it is implemented and whether its engine is ready."""
+status: ok (ffmpeg-skill usable, every default engine OK) | degraded (a default engine MISSING / INCOMPATIBLE) | fail
+(Python or ffmpeg-skill not usable). An opt-in engine (ADR-015) is reported under checks.engines like the others, but
+one that is not installed is listed in unavailable_opt_in_engines only: it is not a problem and does not degrade. Each op reports whether it is implemented and whether its engine is ready."""
 from __future__ import annotations
 
 import platform
@@ -11,7 +12,7 @@ import sys
 from typing import Any, Dict, List, Optional
 
 from . import SKILL_ID, __version__
-from .engines import DEFAULT_ENGINE, get_engine, engine_ids
+from .engines import DEFAULT_ENGINE, OPT_IN_ENGINES, get_engine, engine_ids
 from .engines.base import OK
 from .errors import VoiceEnhanceError
 from .ffmpeg_skill import FfmpegSkill
@@ -72,7 +73,8 @@ def doctor(ffmpeg_skill_dir: Optional[str] = None, offline: bool = False) -> Dic
                    "ready": bool(IMPLEMENTED_OPS[op] and media_ok and engine_status == OK)}
     checks["operations"] = ops
     checks["helpers"] = {name: dict(h, ready=bool(h["implemented"] and media_ok)) for name, h in HELPERS.items()}
-    missing_engines = sorted(eid for eid, e in engines.items() if e["status"] != OK)
+    missing_engines = sorted(eid for eid, e in engines.items() if e["status"] != OK and eid not in OPT_IN_ENGINES)
+    missing_opt_in = sorted(eid for eid, e in engines.items() if e["status"] != OK and eid in OPT_IN_ENGINES)
     status = "fail" if problems else ("degraded" if missing_engines else "ok")
     return {
         "schema": DOCTOR_SCHEMA,
@@ -82,6 +84,7 @@ def doctor(ffmpeg_skill_dir: Optional[str] = None, offline: bool = False) -> Dic
         "offline": bool(offline),
         "checks": checks,
         "unavailable_engines": missing_engines,
+        "unavailable_opt_in_engines": missing_opt_in,
         "problems": problems + [f"engine {eid}: {engines[eid]['status']} ({engines[eid].get('detail')})" for eid in missing_engines],
         "warnings": warnings,
         "network": "never used at run time; no engine downloads anything",

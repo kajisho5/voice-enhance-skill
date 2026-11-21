@@ -48,6 +48,7 @@ Every op takes `--overwrite` (an existing output is refused without it), `--time
 | Op | Engine | Install |
 |---|---|---|
 | `isolate` | DeepFilterNet3 through the standalone `deep-filter` binary (v0.5.x, no PyTorch) | Download `deep-filter` for your platform from https://github.com/Rikorose/DeepFilterNet/releases (for example `deep-filter-0.5.6-x86_64-unknown-linux-musl`), and `DeepFilterNet3_onnx.tar.gz` from https://github.com/Rikorose/DeepFilterNet/raw/v0.5.6/models/DeepFilterNet3_onnx.tar.gz (it is not a release asset). Put `deep-filter` on `PATH` (or set `VOICE_ENHANCE_DEEP_FILTER`) and set `VOICE_ENHANCE_DFN_MODEL` to the tarball. |
+| `isolate --engine dpdfnet` (opt-in; the default stays DeepFilterNet3) | DPDFNet 48 kHz ONNX build `dpdfnet2_48khz_hr` (Apache-2.0) through the `dpdfnet` package on onnxruntime, Python >= 3.11 | `pip install -e '.[dpdfnet]'`, download https://huggingface.co/Ceva-IP/DPDFNet/resolve/main/onnx/dpdfnet2_48khz_hr.onnx (10.5 MB) and set `VOICE_ENHANCE_DPDFNET_MODEL` to it. Use it only when the user asks for it; a missing opt-in engine is not a problem in `doctor`. |
 | `dereverb` | nara_wpe 0.0.x (WPE, signal processing, no weights) | `pip install -e '.[wpe]'` |
 | `bleed-reduce` | `crosstalk` (this package, NumPy, no weights) | `pip install -e '.[bleed]'` |
 

@@ -21,15 +21,16 @@ import wave
 from pathlib import Path
 from unittest import mock
 
-from helpers import (OS_DIR, ROOT, crosstalk_fixture, energy_db, env, fake_deep_filter, fake_model, fake_nara_wpe, fake_wpe_calls,
+from helpers import (OS_DIR, ROOT, crosstalk_fixture, energy_db, env, fake_deep_filter, fake_dpdfnet, fake_dpdfnet_calls, fake_dpdfnet_model,
+                     fake_model, fake_nara_wpe, fake_wpe_calls,
                      have_numpy, on_python_path, read_float_wav_channels, read_wav, read_wav_channels, reverb_fixture, run_cli, snr_db, srr_db,
                      voice_noise_fixture, write_tone_wav, write_wav, write_wav_tracks)
 
 from voice_enhance_skill import SKILL_ID, __version__
 from voice_enhance_skill.contract import CAPABILITY_IDS, contract
 from voice_enhance_skill.doctor import doctor
-from voice_enhance_skill.engines import DEFAULT_ENGINE, engine_ids, engines_for, get_engine
-from voice_enhance_skill.engines import crosstalk, deepfilternet, nara_wpe_engine, wavio
+from voice_enhance_skill.engines import DEFAULT_ENGINE, OPT_IN_ENGINES, engine_ids, engines_for, get_engine
+from voice_enhance_skill.engines import crosstalk, deepfilternet, dpdfnet_engine, nara_wpe_engine, wavio
 from voice_enhance_skill.engines.base import OPS, Engine, EngineRequest, EngineResult, parse_version
 from voice_enhance_skill.errors import ERROR_TABLE, EXIT_CODES, VoiceEnhanceError
 from voice_enhance_skill.ffmpeg_skill import FLAGS_USED, OPTIONAL_FLAGS, TOOLS_USED, FfmpegSkill, parse_contract
@@ -163,6 +164,7 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(c["errors"], {k: {"exit_code": e, "retryable": r} for k, (e, r) in ERROR_TABLE.items()})
         self.assertEqual(sorted(c["engines"]["registered"]), engine_ids())
         self.assertEqual(c["engines"]["default"], DEFAULT_ENGINE)
+        self.assertEqual(c["engines"]["opt_in"], ["dpdfnet"])
         for spec in c["engines"]["registered"].values():
             self.assertTrue(spec["code_license"] and spec["weights_license"] and spec["attribution"])
             self.assertFalse(spec["network_required"])
@@ -278,9 +280,12 @@ class SkillMdTests(unittest.TestCase):
 
 class EngineRegistryTests(unittest.TestCase):
     def test_registry(self):
-        self.assertEqual(engine_ids(), ["crosstalk", "deepfilternet", "nara_wpe"])
+        self.assertEqual(engine_ids(), ["crosstalk", "deepfilternet", "dpdfnet", "nara_wpe"])
         self.assertEqual(set(DEFAULT_ENGINE), set(OPS))
-        self.assertEqual(engines_for("isolate"), ["deepfilternet"])
+        self.assertEqual(engines_for("isolate"), ["deepfilternet", "dpdfnet"])
+        self.assertEqual(DEFAULT_ENGINE["isolate"], "deepfilternet")    # ADR-015: DPDFNet is opt-in, not the default
+        self.assertEqual(OPT_IN_ENGINES, frozenset({"dpdfnet"}))
+        self.assertFalse(OPT_IN_ENGINES & set(DEFAULT_ENGINE.values()))
         self.assertEqual(engines_for("dereverb"), ["nara_wpe"])
         self.assertEqual(engines_for("bleed_reduce"), ["crosstalk"])    # ADR-001: no AI engine; ADR-005: signal processing
         self.assertEqual(DEFAULT_ENGINE["bleed_reduce"], "crosstalk")
@@ -1591,7 +1596,7 @@ class FfmpegSkillContractTests(unittest.TestCase):
 class DoctorTests(unittest.TestCase):
     def test_missing_engines_are_reported_missing(self):
         missing = os.path.join(tempfile.gettempdir(), "no-such-ffmpeg-skill")
-        with env(**NO_DEEP_FILTER), mock.patch.object(nara_wpe_engine, "_found", return_value=False), \
+        with env(VOICE_ENHANCE_DPDFNET_MODEL=None, **NO_DEEP_FILTER), mock.patch.object(nara_wpe_engine, "_found", return_value=False), \
                 mock.patch.object(crosstalk, "_found", return_value=False):
             d = doctor(missing)
             rc, cli_doc = run_cli("doctor", "--ffmpeg-skill", missing, "--offline", "--json")
@@ -1599,6 +1604,9 @@ class DoctorTests(unittest.TestCase):
             self.assertEqual(d["checks"]["engines"][eid]["status"], "MISSING")
             self.assertTrue(d["checks"]["engines"][eid]["install"])
         self.assertEqual(d["unavailable_engines"], ["crosstalk", "deepfilternet", "nara_wpe"])
+        self.assertEqual(d["checks"]["engines"]["dpdfnet"]["status"], "MISSING")      # opt-in (ADR-015): listed, not a problem
+        self.assertEqual(d["unavailable_opt_in_engines"], ["dpdfnet"])
+        self.assertFalse([p for p in d["problems"] if "dpdfnet" in p])
         self.assertEqual(d["checks"]["ffmpeg_skill"]["status"], "MISSING")
         self.assertEqual((d["status"], d["ok"]), ("fail", False))
         self.assertEqual(set(d["checks"]["operations"]), set(OPS))
@@ -1654,6 +1662,161 @@ class ConformanceTests(unittest.TestCase):
                                                       "no_unsafe_shell_out", "doctor_status"])
         for r in results:
             self.assertEqual(r.status, "PASS", f"{r.check}: {r.detail}")
+
+
+DPDFNET_PY = sys.version_info[:2] >= dpdfnet_engine.MIN_PYTHON
+NEEDS_PY311 = "dpdfnet's floor is Python 3.11: the engine reports MISSING below it (the 3.12 jobs run this)"
+
+
+class DpdfNetAvailabilityTests(unittest.TestCase):
+    """The opt-in DPDFNet engine (ADR-015) with mocked package lookups: nothing is installed or imported."""
+
+    def inspect(self, found=True, version="0.6.0", model=None):
+        eng = get_engine("dpdfnet")
+        with mock.patch.object(dpdfnet_engine, "MIN_PYTHON", (3, 0)), \
+                mock.patch.object(dpdfnet_engine, "_found", side_effect=found if callable(found) else (lambda m: found)), \
+                mock.patch.object(dpdfnet_engine, "_dist_version", return_value=version), env(VOICE_ENHANCE_DPDFNET_MODEL=model):
+            return eng.report()
+
+    def test_statuses(self):
+        self.assertEqual(self.inspect(found=False)["status"], "MISSING")
+        r = self.inspect(found=lambda m: m != "onnxruntime")
+        self.assertEqual((r["status"], r["missing"]), ("MISSING", "package"))
+        self.assertIn("onnxruntime", r["detail"])
+        self.assertEqual(self.inspect(version="0.5.1")["status"], "INCOMPATIBLE")
+        self.assertEqual(self.inspect(version="0.7.0")["status"], "INCOMPATIBLE")
+        r = self.inspect()
+        self.assertEqual((r["status"], r["missing"]), ("MISSING", "model"))
+        self.assertIn("[dpdfnet]", r["install"])
+        self.assertIn(dpdfnet_engine.MODEL_URL, r["install"])
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self.inspect(model=fake_dpdfnet_model(tmp, "dpdfnet4.onnx"))           # a 16 kHz build
+            self.assertEqual(r["status"], "INCOMPATIBLE")
+            for name in ("dpdfnet2_48khz_hr.onnx", "dpdfnet8_48khz_hr.onnx"):
+                r = self.inspect(model=fake_dpdfnet_model(tmp, name))
+                self.assertEqual((r["status"], r["model"], r["install"]), ("OK", name, None))
+                self.assertEqual(r["model_bytes"], len(b"fake onnx model"))
+                self.assertEqual(r["model_sha256"], sha256_file(os.path.join(tmp, name)))
+
+    def test_python_floor(self):
+        with mock.patch.object(dpdfnet_engine, "MIN_PYTHON", (99, 0)):
+            r = get_engine("dpdfnet").inspect()
+        self.assertEqual((r["status"], r["missing"]), ("MISSING", "package"))
+        self.assertIn("Python >= 99.0", r["detail"])
+
+    def test_spec(self):
+        spec = get_engine("dpdfnet").spec()
+        self.assertEqual((spec["ops"], spec["kind"], spec["code_license"], spec["weights_license"]),
+                         (["isolate"], "python", "Apache-2.0", "Apache-2.0"))
+        self.assertFalse(spec["network_required"])
+        self.assertEqual(sorted(dpdfnet_engine.MODELS), ["dpdfnet2_48khz_hr.onnx", "dpdfnet8_48khz_hr.onnx"])
+        self.assertEqual(dpdfnet_engine.MODELS["dpdfnet2_48khz_hr.onnx"][1], 10493337)      # 10.5 MB on Hugging Face
+
+    def test_mix_ratio(self):
+        self.assertEqual(dpdfnet_engine.mix_ratio(None), 0.0)
+        self.assertEqual(dpdfnet_engine.mix_ratio(100), 0.0)
+        self.assertAlmostEqual(dpdfnet_engine.mix_ratio(20), 0.1)
+        self.assertAlmostEqual(dpdfnet_engine.mix_ratio(6), 10 ** (-6 / 20))
+
+    def test_isolate_default_is_still_deepfilternet(self):
+        with env(**NO_DEEP_FILTER), self.assertRaises(VoiceEnhanceError) as e:
+            select_engine("isolate", None)
+        self.assertEqual(e.exception.details["engine"], "deepfilternet")
+        with mock.patch.object(dpdfnet_engine, "_found", return_value=False), self.assertRaises(VoiceEnhanceError) as e:
+            select_engine("isolate", "dpdfnet")
+        self.assertEqual((e.exception.code, e.exception.details["engine"]), ("ENGINE_UNAVAILABLE", "dpdfnet"))
+
+
+@unittest.skipUnless(NUMPY, "needs numpy: the fake dpdfnet computes on it (the integration job installs it)")
+@unittest.skipUnless(DPDFNET_PY, NEEDS_PY311)
+class DpdfNetProcessTests(unittest.TestCase):
+    """DpdfNetEngine.process through the real worker subprocess, and ISOLATE with --engine dpdfnet, with the fake
+    dpdfnet package (it streams like the real one: whole hops, 1920 samples late)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = self._tmp.name
+        self.model = fake_dpdfnet_model(self.tmp)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def run_dpdfnet(self, src, mode="identity", **params):
+        site = fake_dpdfnet(self.tmp, mode=mode)
+        with on_python_path(site), env(VOICE_ENHANCE_DPDFNET_MODEL=self.model):
+            res = run_engine("dpdfnet", EngineRequest("isolate", src, os.path.join(self.tmp, "stem.wav"), sample_rate=48000,
+                                                      params=params), 60, self.tmp)
+        return res, fake_dpdfnet_calls(site)
+
+    def test_identity_is_sample_aligned_and_as_long_as_the_input(self):
+        # 2.5 s plus 123 samples: not a whole number of hops nor of the engine's 10 s read blocks
+        n = 120123
+        x = [0.4 * math.sin(2 * math.pi * 330 * i / 48000) * (1 if (i // 4800) % 2 else 0.2) for i in range(n)]
+        src = write_wav(os.path.join(self.tmp, "in.wav"), x)
+        res, calls = self.run_dpdfnet(src)
+        rate, chans = read_float_wav_channels(res.output_path)
+        _, _, ref = read_wav(src)
+        self.assertEqual((rate, len(chans), len(chans[0])), (48000, 1, n))
+        self.assertLess(max(abs(a - b) for a, b in zip(chans[0], ref)), 1e-6)
+        self.assertEqual(calls, [{"model": "dpdfnet2_48khz_hr", "onnx_path": self.model}])     # the file named, never a download
+        self.assertEqual((res.engine_version, res.model), ("0.6.0", "dpdfnet2_48khz_hr.onnx"))
+        self.assertEqual(res.extra["model_sha256"], sha256_file(self.model))
+        self.assertFalse(res.extra["model_known"])                       # not the published weights
+        self.assertEqual((res.extra["compensate_delay"], res.extra["delay_samples"], res.extra["output_format"]),
+                         (True, 1920, "pcm_f32le"))
+
+    def test_atten_lim_mixes_the_input_back(self):
+        n = 48000
+        x = [0.3 * math.sin(2 * math.pi * 5000 * i / 48000) for i in range(n)]      # above the fake's 2 kHz low-pass
+        src = write_wav(os.path.join(self.tmp, "in.wav"), x)
+        res, _ = self.run_dpdfnet(src, mode="lowpass", atten_lim_db=20.0)
+        _, chans = read_float_wav_channels(res.output_path)
+        _, _, ref = read_wav(src)
+        no_limit, _ = self.run_dpdfnet(src, mode="lowpass")
+        _, plain = read_float_wav_channels(no_limit.output_path)
+        mid = slice(9600, n - 9600)
+        expect = [0.1 * r + 0.9 * p for r, p in zip(ref[mid], plain[0][mid])]
+        self.assertLess(max(abs(a - b) for a, b in zip(chans[0][mid], expect)), 1e-5)
+        self.assertEqual(res.extra["atten_lim_db"], 20.0)
+
+    def test_failure_in_dpdfnet_is_engine_failed(self):
+        src = write_tone_wav(os.path.join(self.tmp, "in.wav"), 0.2)
+        with self.assertRaises(VoiceEnhanceError) as e:
+            self.run_dpdfnet(src, mode="fail")
+        self.assertEqual(e.exception.code, "ENGINE_FAILED")
+
+    def test_other_rate_is_refused(self):
+        src = write_tone_wav(os.path.join(self.tmp, "in.wav"), 0.2, rate=16000)
+        site = fake_dpdfnet(self.tmp)
+        with on_python_path(site), env(VOICE_ENHANCE_DPDFNET_MODEL=self.model), self.assertRaises(VoiceEnhanceError) as e:
+            run_engine("dpdfnet", EngineRequest("isolate", src, os.path.join(self.tmp, "stem.wav"), sample_rate=16000), 60, self.tmp)
+        self.assertEqual(e.exception.code, "INVALID_ARGUMENT")
+
+    def test_other_weights_under_the_same_name_are_another_cache_key(self):
+        from voice_enhance_skill.ops import _identity
+        site = fake_dpdfnet(self.tmp)
+        with on_python_path(site), env(VOICE_ENHANCE_DPDFNET_MODEL=self.model):
+            first = _identity(get_engine("dpdfnet").report())
+            Path(self.model).write_bytes(b"other onnx mode")      # same name, same size
+            second = _identity(get_engine("dpdfnet").report())
+        self.assertEqual(first["model_bytes"], second["model_bytes"])
+        self.assertNotEqual(first["model_sha256"], second["model_sha256"])
+
+    def test_isolate_with_engine_dpdfnet_raises_snr(self):
+        src, out = os.path.join(self.tmp, "noisy.wav"), os.path.join(self.tmp, "voice.wav")
+        clean = voice_noise_fixture(src)
+        site = fake_dpdfnet(self.tmp, mode="lowpass")
+        with on_python_path(site), env(VOICE_ENHANCE_DPDFNET_MODEL=self.model, **NO_DEEP_FILTER):
+            doc = isolate(IsolateRequest(src, out, engine="dpdfnet"), skill=StubSkill())
+        rate, ch, stem = read_wav(out)
+        self.assertEqual((rate, ch, len(stem)), (48000, 1, len(clean)))
+        before, after = snr_db(clean, read_wav(src)[2]), snr_db(clean, stem)
+        self.assertGreater(after, before + 6.0, (before, after))
+        self.assertEqual(doc["engine"], {"id": "dpdfnet", "version": "0.6.0", "model": "dpdfnet2_48khz_hr.onnx",
+                                         "model_sha256": sha256_file(self.model)})
+        self.assertEqual((doc["parameters"]["compensate_delay"], doc["parameters"]["engine_argv"]), (True, None))
+        self.assertEqual(doc["provenance"]["engine"]["weights_license"], "Apache-2.0")
+        json.dumps(doc, allow_nan=False)
 
 
 if __name__ == "__main__":

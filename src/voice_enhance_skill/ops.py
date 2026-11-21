@@ -264,7 +264,7 @@ def _check_common(req: Any) -> None:
 
 def _identity(report: Dict[str, Any]) -> Dict[str, Any]:
     """What names the engine build in a block's cache key (step 11, ADR-009)."""
-    return {k: report.get(k) for k in ("version", "model", "model_bytes", "numpy")}
+    return {k: report.get(k) for k in ("version", "model", "model_bytes", "model_sha256", "numpy")}
 
 
 def _cache_dir(given: Optional[str], directory: str) -> str:
