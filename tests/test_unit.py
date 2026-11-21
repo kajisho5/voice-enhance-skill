@@ -1596,7 +1596,7 @@ class FfmpegSkillContractTests(unittest.TestCase):
 class DoctorTests(unittest.TestCase):
     def test_missing_engines_are_reported_missing(self):
         missing = os.path.join(tempfile.gettempdir(), "no-such-ffmpeg-skill")
-        with env(**NO_DEEP_FILTER), mock.patch.object(nara_wpe_engine, "_found", return_value=False), \
+        with env(VOICE_ENHANCE_DPDFNET_MODEL=None, **NO_DEEP_FILTER), mock.patch.object(nara_wpe_engine, "_found", return_value=False), \
                 mock.patch.object(crosstalk, "_found", return_value=False):
             d = doctor(missing)
             rc, cli_doc = run_cli("doctor", "--ffmpeg-skill", missing, "--offline", "--json")
@@ -1696,6 +1696,7 @@ class DpdfNetAvailabilityTests(unittest.TestCase):
                 r = self.inspect(model=fake_dpdfnet_model(tmp, name))
                 self.assertEqual((r["status"], r["model"], r["install"]), ("OK", name, None))
                 self.assertEqual(r["model_bytes"], len(b"fake onnx model"))
+                self.assertEqual(r["model_sha256"], sha256_file(os.path.join(tmp, name)))
 
     def test_python_floor(self):
         with mock.patch.object(dpdfnet_engine, "MIN_PYTHON", (99, 0)):
@@ -1790,6 +1791,16 @@ class DpdfNetProcessTests(unittest.TestCase):
         with on_python_path(site), env(VOICE_ENHANCE_DPDFNET_MODEL=self.model), self.assertRaises(VoiceEnhanceError) as e:
             run_engine("dpdfnet", EngineRequest("isolate", src, os.path.join(self.tmp, "stem.wav"), sample_rate=16000), 60, self.tmp)
         self.assertEqual(e.exception.code, "INVALID_ARGUMENT")
+
+    def test_other_weights_under_the_same_name_are_another_cache_key(self):
+        from voice_enhance_skill.ops import _identity
+        site = fake_dpdfnet(self.tmp)
+        with on_python_path(site), env(VOICE_ENHANCE_DPDFNET_MODEL=self.model):
+            first = _identity(get_engine("dpdfnet").report())
+            Path(self.model).write_bytes(b"other onnx mode")      # same name, same size
+            second = _identity(get_engine("dpdfnet").report())
+        self.assertEqual(first["model_bytes"], second["model_bytes"])
+        self.assertNotEqual(first["model_sha256"], second["model_sha256"])
 
     def test_isolate_with_engine_dpdfnet_raises_snr(self):
         src, out = os.path.join(self.tmp, "noisy.wav"), os.path.join(self.tmp, "voice.wav")

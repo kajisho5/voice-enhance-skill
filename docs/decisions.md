@@ -484,6 +484,7 @@ Checked 2026-11-21 against the Hugging Face model repository `Ceva-IP/DPDFNet` (
 - **`--atten-lim-db`** keeps its meaning: out = a · input + (1 − a) · enhanced with a = 10^(−L/20), the mix the package applies offline. 100 (or none) means no limit, as for `deep-filter`.
 - **Output** is 32-bit float, 48 kHz mono, so nothing is clipped. The ISOLATE result shape (`voice-enhance/isolate@1`) does not change. `parameters.engine_argv` is `null` (no binary), and `compensate_delay` is `true`.
 - **doctor.** A missing opt-in engine is reported under `checks.engines` as before. It goes into the new `unavailable_opt_in_engines` list and is neither a problem nor a reason for `degraded`. An install that was `ok` before this release stays `ok`.
+- **Block cache.** The engine report carries `model_sha256`, and ADR-009's block-cache identity includes it, so other weights under the same file name and size never reuse cached blocks.
 - **Tests and CI.** Following the repository's pattern (a fake `deep-filter`, a fake `nara_wpe`), the unit and integration tests use a fake `dpdfnet` package. Like the real one, it returns whole hops 1920 samples late, and a stub `onnxruntime` comes with it. The real-engine tests (`test_real_dpdfnet_*`) skip unless the real package and model are installed. **No CI job downloads the DPDFNet model**, so the engines job allows exactly those skips and checks only the default engines for `OK`.
 
 ### Verified (locally, not in CI)

@@ -163,8 +163,11 @@ class DpdfNetEngine(Engine):
         if name not in MODELS:
             return {"status": INCOMPATIBLE, "version": vstr, "model": name,
                     "detail": f"{ENV_MODEL} must name a 48 kHz DPDFNet ONNX build ({', '.join(sorted(MODELS))})"}
+        # The weights' digest (10-15 MB, hashed in well under a second) is part of the report, so ADR-009's block cache
+        # key changes when the file is replaced by other weights under the same name and size.
         return {"status": OK, "version": vstr, "detail": f"dpdfnet {vstr}, model {name}", "model": name,
-                "model_bytes": os.path.getsize(model), "onnxruntime": _dist_version("onnxruntime"), "numpy": _dist_version("numpy")}
+                "model_bytes": os.path.getsize(model), "model_sha256": sha256_file(model),
+                "onnxruntime": _dist_version("onnxruntime"), "numpy": _dist_version("numpy")}
 
     def process(self, req: EngineRequest) -> EngineResult:
         """Runs in the worker. `req.input_path` is a 48 kHz mono WAV; the stem (32-bit float, same length) is written to
