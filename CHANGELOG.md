@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.0 - 2026-11-21
+
+- feat!: 1.0.0 - bleed-reduce is STABLE; isolate and dereverb stay EXPERIMENTAL (ADR-014) (#26) (b2647c5)
+- ci: a contract:breaking pull request on 1.x needs the major label (Velisa ADR-031 section 5) (#25) (c859dcb)
+- ci: release gate leaves contract:* labels out of the count (#24) (5a727ca)
+- ci: Velisa's reusable changelog-check/release-guard; dependencies PRs release a patch (D36, D37) (#23) (59d3252)
+
 ## 0.1.3 - 2026-11-19
 
 - fix(release): CHANGELOG headings in this file's form; test the release commit before pushing; no release for chore/ci/docs-only changes (#22) (2a0dffb)
